@@ -339,7 +339,9 @@ describe('layer 1 holds without layer 2 (membrane and codegen flag off)', () => 
     assert.equal(r.exitCode, 0, r.stderr);
     assert.match(r.stdout, /host realm reachable: function/);
     assert.match(r.stdout, /host env keys: 0/, 'the host process env is scrubbed at boot');
-    assert.match(r.stdout, /read win\.ini denied ERR_ACCESS_DENIED/);
+    // On Windows the file exists and the permission model refuses the read. On macOS and Linux there is no
+    // C:/Windows/win.ini, so the read fails with ENOENT. Either way the read must not succeed (checked by REACHED above).
+    assert.match(r.stdout, /read win\.ini denied (ERR_ACCESS_DENIED|ENOENT)/);
     assert.match(r.stdout, /write host file denied ERR_ACCESS_DENIED/);
     assert.match(r.stdout, /spawn host process denied ERR_ACCESS_DENIED/);
     assert.match(r.stdout, /exec host shell denied ERR_ACCESS_DENIED/);

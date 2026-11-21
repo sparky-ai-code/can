@@ -99,6 +99,11 @@ const SERVER_JS = "require('http').createServer((q, s) => { s.setHeader('content
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'can-shot-test-'));
 after(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
+// The MCP and CLI tests below check the screenshot tool's plumbing, not a host Chrome. A mounts file with
+// "chromiumBrowser": false makes them use the built-in browser, so they do not depend on what is installed
+// (on the GitHub macOS runner the real Chromium path hung).
+const BUILTIN_MOUNTS = path.join(tmpRoot, 'mounts.json');
+fs.writeFileSync(BUILTIN_MOUNTS, JSON.stringify({ chromiumBrowser: false }));
 
 /** Makes a symbolic link (junction on Windows); false when the OS refuses (Windows without the link privilege). */
 function tryLink(target, link) {
@@ -137,9 +142,16 @@ class McpClient {
     });
   }
 
-  request(method, params) {
+  // A request that gets no reply fails after 60 s with the server's stderr, instead of hanging until the suite times out.
+  request(method, params, timeoutMs = 60_000) {
     const id = this.nextId++;
-    const response = new Promise((resolve) => this.waiting.set(id, resolve));
+    const response = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.waiting.delete(id);
+        reject(new Error(`no reply to ${method} within ${timeoutMs} ms. Server stderr:\n${this.stderr.slice(-2000)}`));
+      }, timeoutMs);
+      this.waiting.set(id, (msg) => { clearTimeout(timer); resolve(msg); });
+    });
     this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
     return response;
   }
@@ -416,7 +428,7 @@ describe('can side: the VM child renders, the host gets the bytes', LONG, () => 
   });
 
   test('MCP browser_screenshot: image block, PNG in the can, copy in the transfer root, refused escapes', async () => {
-    const env = { CAN_STORE_DIR: storeDir, CAN_TRANSFER_DIR: transferDir };
+    const env = { CAN_STORE_DIR: storeDir, CAN_TRANSFER_DIR: transferDir, CAN_MOUNTS_FILE: BUILTIN_MOUNTS };
     const client = new McpClient(env);
     try {
       await client.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } });
@@ -478,7 +490,7 @@ describe('can side: the VM child renders, the host gets the bytes', LONG, () => 
       t.diagnostic('symbolic links are not permitted here; the link check was skipped');
       return;
     }
-    const client = new McpClient({ CAN_STORE_DIR: storeDir, CAN_TRANSFER_DIR: transferDir });
+    const client = new McpClient({ CAN_STORE_DIR: storeDir, CAN_TRANSFER_DIR: transferDir, CAN_MOUNTS_FILE: BUILTIN_MOUNTS });
     try {
       await client.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } });
       const r = await client.call('browser_screenshot', { can: 'mcpshot', hostPath: 'linked/x.png' });
@@ -491,7 +503,7 @@ describe('can side: the VM child renders, the host gets the bytes', LONG, () => 
   });
 
   test('CLI screenshot writes into the transfer root; escapes and bad flags are refused', () => {
-    const env = { CAN_STORE_DIR: storeDir, CAN_TRANSFER_DIR: path.join(tmpRoot, 'cli-transfer') };
+    const env = { CAN_STORE_DIR: storeDir, CAN_TRANSFER_DIR: path.join(tmpRoot, 'cli-transfer'), CAN_MOUNTS_FILE: BUILTIN_MOUNTS };
     assert.equal(cli(['create', 'clishot'], env).code, 0);
     const ok = cli(['screenshot', 'clishot', '--out', 'cli.png', '--width', '320', '--height', '200'], env);
     assert.equal(ok.code, 0, ok.stderr);

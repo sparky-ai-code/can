@@ -345,7 +345,10 @@ describe('MCP server over stdio', LONG, () => {
 
     const gone = await client.ok('can_destroy', { can: 'web' });
     assert.match(gone, /destroyed can "web"/);
-    assert.equal(fs.readdirSync(storeDir).filter((f) => f.endsWith('.json')).length, 0);
+    // Other cans may still be saved (a failed can_ci run keeps its can on purpose), so check only this one.
+    const savedNames = fs.readdirSync(storeDir).filter((f) => f.endsWith('.json'))
+      .map((f) => JSON.parse(fs.readFileSync(path.join(storeDir, f), 'utf8')).name);
+    assert.deepEqual(savedNames.filter((n) => n === 'web'), [], 'the destroyed can has no saved file');
     assert.equal((await client.tool('can_exec', { can: 'web', command: 'true' })).isError, true);
   });
 
