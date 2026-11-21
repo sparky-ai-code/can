@@ -1,0 +1,18 @@
+{
+  "name": "can",
+  "version": "0.1.0",
+  "description": "Fully virtual sandbox machines for AI agents. Built from scratch, zero dependencies.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "can": "bin/can.js",
+    "can-mcp": "bin/can-mcp.js"
+  },
+  "main": "src/can.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
