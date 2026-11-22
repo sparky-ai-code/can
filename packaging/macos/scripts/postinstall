@@ -1,0 +1,26 @@
+#!/bin/sh
+# Runs as root after the package is installed. Sets up the agent skill and the MCP registration for the
+# account that is logged in at the console, using the bundled node. Never fails the install: a problem is
+# printed and the user can run the setup again by hand (see README.md).
+NODE=/usr/local/lib/can/node/bin/node
+SETUP=/usr/local/lib/can/app/scripts/agent-setup.js
+
+user=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)
+if [ -z "$user" ] || [ "$user" = root ]; then user=${SUDO_USER:-}; fi
+if [ -z "$user" ] || [ "$user" = root ]; then
+  echo "Can: no user is logged in, so the agent skill and MCP registration were not set up."
+  exit 0
+fi
+
+home=$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | sed 's/^NFSHomeDirectory: //')
+if [ -z "$home" ]; then
+  echo "Can: could not find the home folder of $user; the agent skill and MCP registration were not set up."
+  exit 0
+fi
+
+if /usr/bin/sudo -H -u "$user" "$NODE" "$SETUP" install; then
+  echo "Can: agent skill and MCP registration set up for $user."
+else
+  echo "Can: agent setup did not finish for $user. Run: $NODE $SETUP install"
+fi
+exit 0

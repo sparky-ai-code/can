@@ -1,0 +1,199 @@
+name: Installers
+
+# Builds the Windows (.exe) and macOS (.pkg) installers, installs each one on a clean runner, runs the smoke test
+# against the installed copy, then uninstalls it. Pushes to main and pull requests build and test; a version tag
+# (v0.1.0, ...) also publishes the installers and SHA256SUMS.txt to a GitHub release.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The Node runtime bundled into the installers. Same major version the tests run on; check the checksum below.
+  BUNDLED_NODE_VERSION: '24.15.0'
+
+jobs:
+  windows:
+    name: Windows installer (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.BUNDLED_NODE_VERSION }}
+
+      - name: Fetch the bundled Node runtime and verify its checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = "https://nodejs.org/dist/v$env:BUNDLED_NODE_VERSION"
+          $zip = "node-v$env:BUNDLED_NODE_VERSION-win-x64.zip"
+          Invoke-WebRequest "$base/$zip" -OutFile $zip
+          Invoke-WebRequest "$base/SHASUMS256.txt" -OutFile SHASUMS256.txt
+          $line = Select-String -Path SHASUMS256.txt -Pattern " $zip$" | Select-Object -First 1
+          $expected = $line.Line.Split(' ')[0]
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "checksum mismatch for $zip" }
+          Expand-Archive $zip -DestinationPath node-runtime
+          echo "NODE_BUNDLE=$PWD\node-runtime\node-v$env:BUNDLED_NODE_VERSION-win-x64\node.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Stage the app and build the installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).version"
+          node packaging/stage.mjs --platform win32 --node $env:NODE_BUNDLE --out dist/stage/windows-x64
+          choco install innosetup --no-progress -y
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { $iscc = Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe' }
+          $stage = (Resolve-Path dist/stage/windows-x64).Path
+          $out = (Resolve-Path dist).Path
+          $script = (Resolve-Path packaging/windows/can.iss).Path
+          & $iscc "/DAppVersion=$version" "/DStageDir=$stage" "/DOutDir=$out" $script
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+          echo "INSTALLER=$out\Can-$version-windows-x64-setup.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install silently
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $p = Start-Process $env:INSTALLER -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG=install.log' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 60; throw "installer exited $($p.ExitCode)" }
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\Can'
+          if (-not (Test-Path (Join-Path $app 'cmd\can.cmd'))) { throw 'can.cmd was not installed' }
+          $path = (Get-ItemProperty 'HKCU:\Environment').Path
+          if ($path -notlike "*$app\cmd*") { throw 'the install did not add the cmd folder to the user PATH' }
+          echo "CAN_APP=$app" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Smoke test the installed commands and MCP server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node packaging/smoke-test.mjs `
+            --can "$env:CAN_APP\cmd\can.cmd" `
+            --can-mcp "$env:CAN_APP\cmd\can-mcp.cmd" `
+            --node "$env:CAN_APP\node\node.exe" `
+            --setup "$env:CAN_APP\app\scripts\agent-setup.js"
+
+      - name: Uninstall silently and check the cleanup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $uninstaller = Join-Path $env:CAN_APP 'unins000.exe'
+          $p = Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG=uninstall.log' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content uninstall.log -Tail 60; throw "uninstaller exited $($p.ExitCode)" }
+          if (Test-Path $env:CAN_APP) { throw 'the app folder is still there after uninstall' }
+          $path = (Get-ItemProperty 'HKCU:\Environment').Path
+          if ($path -like "*$env:CAN_APP\cmd*") { throw 'the PATH entry was not removed' }
+          if (Test-Path (Join-Path $env:USERPROFILE '.claude\skills\can')) { throw 'the agent skill was not removed' }
+
+      - name: Keep the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: can-windows-x64
+          path: dist/Can-*-windows-x64-setup.exe
+          if-no-files-found: error
+
+  macos:
+    name: macOS installer (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.BUNDLED_NODE_VERSION }}
+
+      - name: Fetch the bundled Node runtime and verify its checksum
+        run: |
+          set -euo pipefail
+          base="https://nodejs.org/dist/v$BUNDLED_NODE_VERSION"
+          file="node-v$BUNDLED_NODE_VERSION-darwin-${{ matrix.arch }}.tar.gz"
+          curl -fsSLO "$base/$file"
+          curl -fsSLO "$base/SHASUMS256.txt"
+          grep " $file\$" SHASUMS256.txt | shasum -a 256 -c -
+          tar -xzf "$file"
+          echo "NODE_BUNDLE=$PWD/node-v$BUNDLED_NODE_VERSION-darwin-${{ matrix.arch }}/bin/node" >> "$GITHUB_ENV"
+
+      - name: Stage the app and build the installer
+        run: |
+          set -euo pipefail
+          version=$(node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).version")
+          node packaging/stage.mjs --platform darwin --node "$NODE_BUNDLE" --out dist/stage/macos-${{ matrix.arch }}
+          sh packaging/macos/build-pkg.sh dist/stage/macos-${{ matrix.arch }} "$version" "dist/Can-$version-macos-${{ matrix.arch }}.pkg"
+          echo "INSTALLER=$PWD/dist/Can-$version-macos-${{ matrix.arch }}.pkg" >> "$GITHUB_ENV"
+
+      - name: Install
+        run: |
+          set -euo pipefail
+          echo "console user: $(/usr/bin/stat -f%Su /dev/console)"
+          sudo installer -pkg "$INSTALLER" -target /
+          test -x /usr/local/lib/can/node/bin/node
+          test -x /usr/local/bin/can
+          test -x /usr/local/bin/can-mcp
+
+      - name: Smoke test the installed commands and MCP server
+        run: |
+          set -euo pipefail
+          node packaging/smoke-test.mjs \
+            --can /usr/local/bin/can \
+            --can-mcp /usr/local/bin/can-mcp \
+            --node /usr/local/lib/can/node/bin/node \
+            --setup /usr/local/lib/can/app/scripts/agent-setup.js
+
+      - name: Uninstall and check the cleanup
+        run: |
+          set -euo pipefail
+          sudo sh /usr/local/lib/can/uninstall.sh
+          test ! -e /usr/local/bin/can
+          test ! -e /usr/local/bin/can-mcp
+          test ! -e /usr/local/lib/can
+          test ! -e "$HOME/.claude/skills/can"
+
+      - name: Keep the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: can-macos-${{ matrix.arch }}
+          path: dist/Can-*-macos-${{ matrix.arch }}.pkg
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: installers
+          merge-multiple: true
+
+      - name: Write checksums and create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd installers
+          sha256sum Can-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" Can-* SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Can $GITHUB_REF_NAME" \
+            --generate-notes

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // MCP server for Can over stdio. Register with Claude Code:
-//   claude mcp add can -- node C:\Users\Lenovo\Downloads\can\bin\can-mcp.js
+//   claude mcp add can -- node <path-to-can>\bin\can-mcp.js
 // Protocol messages go to stdout; logs go to stderr. Saved cans live in $CAN_STORE_DIR or ~/.can/cans.
 import { startMcpServer } from '../src/mcp/server.js';
 import { CanRegistry } from '../src/registry.js';

@@ -10,10 +10,31 @@ client (`CanManager` and `Can` in `src/`). The agent-facing interfaces are an MC
 
 Requires Node.js 20 or newer. Verified on Node 24.15.0 and Windows 11.
 
+## Install (Windows and macOS)
+
+Download the installer for your system from the Releases page of this repository:
+
+- **Windows:** `Can-<version>-windows-x64-setup.exe`. It installs for your account only, so no administrator rights are needed.
+- **macOS:** `Can-<version>-macos-arm64.pkg` on Apple silicon, or `Can-<version>-macos-x64.pkg` on Intel.
+
+The installer bundles Node.js, so nothing else needs to be installed. It sets up three things for agents:
+
+- The `can` and `can-mcp` commands. On Windows the folder is added to your PATH; on macOS they live in `/usr/local/bin`.
+- The agent skill, copied to `~/.claude/skills/can/SKILL.md`.
+- The `can` MCP server, registered in Claude Code (`~/.claude.json`) and in Claude Desktop when Claude Desktop is set up on the account.
+
+There is no app window or front end. Restart Claude Code or Claude Desktop after installing so they load the tools.
+
+The installers are not code-signed yet, so the system warns on first run. On Windows, choose **More info**, then **Run anyway**. On macOS, open the `.pkg` once, then allow it under **System Settings > Privacy & Security > Open Anyway**.
+
+To uninstall, use **Settings > Apps > Can** on Windows. On macOS run `sudo sh /usr/local/lib/can/uninstall.sh`. Saved cans in `~/.can` are kept either way.
+
+To check or repair the agent setup, run `node <install folder>\app\scripts\agent-setup.js status`, or `... install` to set it up again. The Windows install folder is `%LOCALAPPDATA%\Programs\Can`; on macOS it is `/usr/local/lib/can`, with the bundled Node at `node/bin/node`.
+
 ## Quick start
 
 ```powershell
-cd C:\Users\Lenovo\Downloads\can
+cd <path-to-can>
 node --test                        # run the test suites (zero dependencies)
 
 node bin\can.js create demo        # create and save a can
@@ -26,8 +47,10 @@ node bin\can.js rm demo
 
 ## Register with Claude Code
 
+The installers do this for you. To register from a checkout instead:
+
 ```powershell
-claude mcp add can -- node C:\Users\Lenovo\Downloads\can\bin\can-mcp.js
+claude mcp add can -- node <path-to-can>\bin\can-mcp.js
 ```
 
 Claude Code then gets the tools listed below. The MCP server speaks JSON-RPC 2.0 over stdio, protocol version
@@ -433,6 +456,23 @@ These are stated plainly, from `SPEC.md` section 10.4:
   marked as omitted.
 - **POSIX paths inside a can.** Paths are `/home/agent`, `/app`, `/tmp` and so on. Relative paths start in `/home/agent`.
 
+## Building the installers
+
+The Windows and macOS installers are built by `.github/workflows/installers.yml`. Each one bundles the pinned Node
+runtime (`BUNDLED_NODE_VERSION` in that file, checked against nodejs.org's SHA256SUMS), the app, the skill and the
+setup script. The workflow installs each package on a clean runner, runs `packaging/smoke-test.mjs` against it,
+and uninstalls it. Pushing a `v*` tag also publishes the installers and `SHA256SUMS.txt` as a release.
+
+To build a Windows installer by hand, with Inno Setup 6 installed:
+
+```powershell
+node packaging\stage.mjs --platform win32 --node <path to node.exe> --out dist\stage\windows-x64
+iscc /DAppVersion=0.1.0 /DStageDir=<full path>\dist\stage\windows-x64 /DOutDir=<full path>\dist packaging\windows\can.iss
+```
+
+Use full paths for `StageDir` and `OutDir`: Inno Setup resolves relative ones against the script folder. On macOS,
+run `node packaging/stage.mjs --platform darwin ...` and then `sh packaging/macos/build-pkg.sh <stage dir> <version> <out.pkg>`.
+
 ## Layout
 
 ```
@@ -458,5 +498,7 @@ src/browser/svg.js      SVG rasteriser for shapes, paths, styles and <use>
 src/browser/image.js    Picks the decoder for an image from its first bytes
 src/browser/font.js     The built-in 5x7 bitmap font used by the renderer
 test/                   node --test suites
+packaging/              Installers: stage.mjs, agent-setup.js (skill and MCP setup), smoke-test.mjs,
+                        windows/can.iss (Inno Setup), macos/ (pkg build, postinstall, uninstall)
 SPEC.md                 Architecture and binding interface spec
 ```

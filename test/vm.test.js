@@ -187,7 +187,7 @@ describe('escape attempts from can code fail (layer 1 and layer 2)', () => {
     assert.match(r.stdout, /PATH=\/usr\/local\/bin:\/usr\/bin:\/bin/);
     assert.match(r.stdout, /keys=HOME,LANG,PATH,SHELL,TMPDIR,USER/);
     assert.doesNotMatch(r.stdout, /host env keys=/);
-    assert.doesNotMatch(r.stdout, /SYSTEMROOT|WINDIR|Lenovo/);
+    assert.doesNotMatch(r.stdout, /SYSTEMROOT|WINDIR|Users[\x5c/]/);
   });
 
   test('host process internals (binding, dlopen, getBuiltinModule) are absent from can code', async () => {
@@ -200,7 +200,7 @@ describe('escape attempts from can code fail (layer 1 and layer 2)', () => {
   test('can code cannot read host files with real paths', async () => {
     const r = await runProbe(can, `
       const fs = require('fs');
-      for (const p of ['C:/Windows/win.ini', 'C:/Users/Lenovo/.ssh/id_rsa', ${JSON.stringify(path.join(PROJECT_ROOT, 'package.json').replace(/\\/g, '/'))}]) {
+      for (const p of ['C:/Windows/win.ini', 'C:/Users/someone/.ssh/id_rsa', ${JSON.stringify(path.join(PROJECT_ROOT, 'package.json').replace(/\\/g, '/'))}]) {
         try { fs.readFileSync(p); console.log('READ', p); } catch (e) { console.log('denied', e.code); }
       }
     `);

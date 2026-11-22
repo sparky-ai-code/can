@@ -451,13 +451,13 @@ describe('stack traces show can frames only', () => {
     assert.equal(r.exitCode, 1);
     assert.match(r.stderr, /Error: boom in can/);
     assert.match(r.stderr, /boom\.js/, 'the can frame is kept');
-    assert.doesNotMatch(r.stderr, /file:|node:internal|src[\x5c/]|Lenovo|Downloads/, r.stderr);
+    assert.doesNotMatch(r.stderr, /file:|node:internal|src[\x5c/]|Users[\x5c/]|Downloads/, r.stderr);
   });
 
   test('a stack read inside can code shows no host frame either', async () => {
     const can = await makeCan();
     const r = await sh(can, `node -e "try { require('fs').readFileSync('/no/such/file') } catch (e) { console.log(e.stack) }"`);
     assert.match(r.stdout, /ENOENT/);
-    assert.doesNotMatch(r.stdout, /file:|node:internal|Lenovo|Downloads/, r.stdout);
+    assert.doesNotMatch(r.stdout, /file:|node:internal|Users[\x5c/]|Downloads/, r.stdout);
   });
 });
