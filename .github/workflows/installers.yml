@@ -43,6 +43,12 @@ jobs:
           Expand-Archive $zip -DestinationPath node-runtime
           echo "NODE_BUNDLE=$PWD\node-runtime\node-v$env:BUNDLED_NODE_VERSION-win-x64\node.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Build the memory helper
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node native/win/build.js
+
       - name: Stage the app and build the installer
         shell: pwsh
         run: |

@@ -2,7 +2,7 @@
 // or see host environment variables. Each test runs real escape attempts inside a can VM process.
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
@@ -13,6 +13,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { CanManager } from '../src/manager.js';
 import { Membrane } from '../src/vm/membrane.js';
 import { vmExecArgv, SRC_DIR, VM_HEAP_MB } from '../src/vm/supervisor.js';
+import { bundleDir, cacheDir, lockFilePath } from '../src/toolchains.js';
 
 const MANIFEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(MANIFEST_DIR, '..');
@@ -315,6 +316,17 @@ describe('layer 1 holds without layer 2 (membrane and codegen flag off)', () => 
     can = await manager.create({ name: 'layer1-only' });
   });
 
+  test('a worker thread started inside the VM process is still denied file and process access', () => {
+    // Real process with the real flags: a worker reads a host file and spawns a host shell. Both are refused.
+    const inner = "const fs = require('node:fs'); try { fs.readFileSync('C:/Windows/win.ini'); console.log('READ') } catch (e) { console.log('read', e.code) } try { require('node:child_process').execSync('echo x'); console.log('SPAWN') } catch (e) { console.log('spawn', e.code) }";
+    const script = `const { Worker } = require('node:worker_threads'); const w = new Worker(${JSON.stringify(inner)}, { eval: true }); w.on('exit', () => process.exit(0));`;
+    const res = spawnSync(process.execPath, [...vmExecArgv({}), '-e', script], { encoding: 'utf8', timeout: 20_000 });
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, /read (ERR_ACCESS_DENIED|ENOENT)/);
+    assert.match(res.stdout, /spawn ERR_ACCESS_DENIED/);
+    assert.doesNotMatch(res.stdout, /^(READ|SPAWN)$/m);
+  });
+
   test('host Function is reachable here, yet file, process, env and worker access is denied by the OS-level model', async () => {
     const marker = hostMarker('layer1');
     const target = marker.replace(/\\/g, '/');
@@ -333,6 +345,8 @@ describe('layer 1 holds without layer 2 (membrane and codegen flag off)', () => 
       attempt('exec host shell', () => host.getBuiltinModule('child_process').execSync('echo pwned'));
       attempt('process.binding fs', () => host.binding('fs'));
       attempt('dlopen', () => host.dlopen({ exports: {} }, 'x.node'));
+      // --allow-worker is on (wasm runs in a worker), so creating a worker is allowed; what it may do is checked by
+      // the worker test below.
       attempt('worker thread', () => new (host.getBuiltinModule('worker_threads').Worker)('1', { eval: true }));
       attempt('inspector open', () => host.getBuiltinModule('inspector').open(0, '127.0.0.1', false));
     `);
@@ -347,9 +361,10 @@ describe('layer 1 holds without layer 2 (membrane and codegen flag off)', () => 
     assert.match(r.stdout, /exec host shell denied ERR_ACCESS_DENIED/);
     assert.match(r.stdout, /process\.binding fs denied ERR_ACCESS_DENIED/);
     assert.match(r.stdout, /dlopen denied ERR_DLOPEN_DISABLED/);
-    assert.match(r.stdout, /worker thread denied ERR_ACCESS_DENIED/);
+    assert.match(r.stdout, /worker thread REACHED/, 'the worker starts (--allow-worker); see the next test for what it may do');
     assert.match(r.stdout, /inspector open denied/);
-    assert.doesNotMatch(r.stdout, /REACHED/);
+    // Every attempt is refused except creating the worker itself (--allow-worker); the worker's own access is tested above.
+    assert.doesNotMatch(r.stdout.replace('worker thread REACHED', 'worker thread started'), /REACHED/, r.stdout);
     assert.equal(fs.existsSync(marker), false);
   });
 });
@@ -358,10 +373,12 @@ describe('the can VM process is started with Node\'s permission model', () => {
   test('the flags allow reads of the project src directory only', () => {
     const flags = vmExecArgv({ layer2: true });
     assert.ok(flags.includes('--permission'));
-    assert.deepEqual(flags.filter((f) => f.startsWith('--allow-')), [`--allow-fs-read=${SRC_DIR}`]);
+    // Exactly the source folder, the two toolchain folders (bundled and cached) and the tool lock file, nothing else.
+    // The worker flag is the one non-read allow: wasm runs in a worker thread (see vmExecArgv).
+    assert.deepEqual(flags.filter((f) => f.startsWith('--allow-')), [...[SRC_DIR, bundleDir(), cacheDir(), lockFilePath()].map((d) => `--allow-fs-read=${d}`), '--allow-worker']);
     assert.ok(flags.includes('--disallow-code-generation-from-strings'));
     assert.ok(flags.includes(`--max-old-space-size=${VM_HEAP_MB}`), 'the heap is capped');
-    for (const forbidden of ['--allow-fs-write', '--allow-child-process', '--allow-worker', '--allow-addons',
+    for (const forbidden of ['--allow-fs-write', '--allow-child-process', '--allow-addons',
       '--allow-wasi', '--allow-inspector']) {
       assert.equal(flags.some((f) => f.startsWith(forbidden)), false, forbidden);
     }
@@ -381,7 +398,7 @@ describe('the can VM process is started with Node\'s permission model', () => {
     assert.match(ps, /--permission/);
     assert.match(ps, /--allow-fs-read=/);
     assert.match(ps, new RegExp(`--max-old-space-size=${VM_HEAP_MB}`));
-    assert.doesNotMatch(ps, /--allow-(fs-write|child-process|worker|addons|wasi|inspector)/);
+    assert.doesNotMatch(ps, /--allow-(fs-write|child-process|addons|wasi|inspector)/);
   });
 });
 

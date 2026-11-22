@@ -7,12 +7,14 @@ import nodeHttp from 'node:http';
 import nodeHttps from 'node:https';
 import { runScript, childShell, makeShell, finishTop } from './shell.js';
 import { startJsFile, checkSyntax, nodeVersionOf } from './js.js';
-import { asReadable } from './io.js';
+import { asReadable, readAll, SyncInput } from './io.js';
 import { TEXT_BUILTINS, splitFlags } from './textcmds.js';
 import { UTIL_BUILTINS } from './utilcmds.js';
 import { SHELL_BUILTINS } from './shellcmds.js';
 import { STATUS_CODES } from './http.js';
 import { planTree, materialize, registryName } from './npm.js';
+import { runPip, DEFAULT_INDEX, SITE_PACKAGES } from './pip.js';
+import { runWasm, runPython } from './wasi/run.js';
 import { KernelError } from '../kernel/errors.js';
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0']);
@@ -817,6 +819,115 @@ function* ps(_args, io, sh) {
   return 0;
 }
 
+// ---------------------------------------------------------------- python, pip and wasm programs
+
+const PY_BOOTSTRAP = [
+  '# Written by can: python starts in the can working folder, as a shell does (WASI has no working directory).',
+  'import os as _can_os',
+  'try:',
+  "    _can_os.chdir(_can_os.environ.get('PWD', '/'))",
+  'except OSError:',
+  '    pass',
+  'del _can_os',
+  '',
+].join('\n');
+
+/** Keeps the sitecustomize.py in site-packages that starts python in the can's working folder. */
+function ensurePythonBootstrap(vfs) {
+  const file = posix.join(SITE_PACKAGES, 'sitecustomize.py');
+  if (vfs.exists(file) && vfs.readFile(file, 'utf8') === PY_BOOTSTRAP) return;
+  vfs.mkdir(SITE_PACKAGES, { recursive: true });
+  vfs.writeFile(file, PY_BOOTSTRAP);
+}
+
+/** python's arguments, with a script path made absolute against the can working folder. -c and -m keep the rest. */
+export function pythonArgs(args, cwd) {
+  const out = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '-c' || a === '-m' || a === '-') return [...out, ...args.slice(k)];
+    if (a === '-W' || a === '-X') {
+      out.push(a);
+      if (k + 1 < args.length) out.push(args[++k]);
+      continue;
+    }
+    if (!a.startsWith('-')) return [...out, posix.resolve(cwd, a), ...args.slice(k + 1)];
+    out.push(a);
+  }
+  return out;
+}
+
+/** Standard input for a wasm program: the in-memory input of a pipe or a redirect. A live terminal reads as empty. */
+const programStdin = (io) => (io.stdin instanceof SyncInput ? readAll(io.stdin) : new Uint8Array(0));
+
+function* python(args, io, sh) {
+  try {
+    ensurePythonBootstrap(sh.can.vfs);
+    return yield runPython({
+      args: pythonArgs(args, sh.cwd),
+      vfs: sh.can.vfs,
+      env: { ...sh.env },
+      cwd: sh.cwd,
+      stdin: programStdin(io),
+      stdout: (c) => io.stdout.write(Buffer.from(c)),
+      stderr: (c) => io.stderr.write(Buffer.from(c)),
+    });
+  } catch (err) {
+    if (!(err instanceof KernelError)) throw err;
+    errOut(io, err.message);
+    return 1;
+  }
+}
+
+function* pip(args, io, sh) {
+  try {
+    return yield runPip({
+      args,
+      cwd: sh.cwd,
+      vfs: sh.can.vfs,
+      policy: sh.can.policy,
+      index: sh.env?.CAN_PIP_INDEX || DEFAULT_INDEX,
+      stdout: (s) => io.stdout.write(s),
+      stderr: (s) => io.stderr.write(s),
+    });
+  } catch (err) {
+    if (!(err instanceof KernelError)) throw err;
+    errOut(io, err.message);
+    return 1;
+  }
+}
+
+/**
+ * A command whose name ends in .wasm: a wasm32-wasip1 program, run by the WASI runtime on the can's files. WASI has
+ * no working directory, so relative file arguments that exist in the can are made absolute against the can cwd.
+ */
+export function* runWasmFile(name, args, io, sh) {
+  const v = sh.can.vfs;
+  const file = resolveIn(sh, name);
+  if (!v.exists(file) || !v.stat(file).isFile()) {
+    errOut(io, `ENOENT: ${name} is not a file in this can. Next: check the path, or copy a wasm32-wasip1 build in with can_write_file.`);
+    return 127;
+  }
+  const argv = [name, ...args.map((a) => (a.startsWith('-') || a.startsWith('/') || !v.exists(resolveIn(sh, a)) ? a : resolveIn(sh, a)))];
+  try {
+    return yield runWasm({
+      bytes: v.readFile(file),
+      path: file,
+      args: argv,
+      env: { ...sh.env },
+      cwd: sh.cwd,
+      vfs: v,
+      stdin: programStdin(io),
+      stdout: (c) => io.stdout.write(Buffer.from(c)),
+      stderr: (c) => io.stderr.write(Buffer.from(c)),
+    });
+  } catch (err) {
+    if (!(err instanceof KernelError)) throw err;
+    errOut(io, err.message);
+    return 1;
+  }
+}
+
 const CORE = {
   pwd: function* (_a, io, sh) { io.stdout.write(`${sh.cwd}\n`); return 0; },
   cd,
@@ -870,6 +981,10 @@ const CORE = {
   pnpm,
   npx,
   curl,
+  python,
+  python3: python,
+  pip,
+  pip3: pip,
   help: function* (_a, io) {
     io.stdout.write(`Built-in commands:\n  ${[...CORE_NAMES()].sort().join(' ')}\n`);
     return 0;

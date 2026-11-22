@@ -334,17 +334,51 @@ describe('resource limits: default command timeout and heap cap', () => {
     assert.equal(new Machine({ id: 'limit-check2', execTimeoutMs: 0 }).execTimeoutMs, 0);
   });
 
-  test('a can that exhausts its heap crashes alone; another can keeps working', async () => {
+  test('a can that exhausts its heap is stopped with memory-limit (ENOMEM) alone; another can keeps working', async () => {
     const manager = newManager();
     const hog = await manager.create({ name: 'hog' });
     const neighbour = await manager.create({ name: 'neighbour' });
     await assert.rejects(
       hog.exec(`node -e "const a = []; for (;;) a.push('x'.repeat(1000000))"`, { timeout: 60_000 }),
-      { code: 'ECHILD' },
+      { code: 'ENOMEM' },
     );
-    await until(() => hog.status === 'crashed');
+    await until(() => hog.status === 'memory-limit');
     assert.equal((await neighbour.exec('echo still here')).stdout, 'still here\n');
     assert.equal(neighbour.status, 'running');
     await manager.destroy('hog');
+  });
+});
+
+describe('worker threads are not available to can code', () => {
+  // --allow-worker lets the VM process start workers (wasm runs in one), so the refusal of can code rests on the
+  // built-in module allowlist (src/runtime/modules.js). These tests check that refusal from can code.
+  test('require of worker_threads, with or without the node: prefix, is refused', async () => {
+    const manager = newManager();
+    const can = await manager.create({ name: 'no-workers' });
+    await can.writeFile('/home/agent/workers.js', `
+      for (const m of ['worker_threads', 'node:worker_threads']) {
+        try { require(m); console.log('loaded', m); } catch (e) { console.log('refused', m, String(e.message).slice(0, 60)); }
+      }
+    `);
+    const r = await can.exec('node workers.js', { timeout: 30_000 });
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.doesNotMatch(r.stdout, /loaded/);
+    assert.match(r.stdout, /refused worker_threads Cannot find module 'worker_threads'/);
+    assert.match(r.stdout, /refused node:worker_threads Cannot find module 'node:worker_threads'/);
+  });
+
+  test('a Worker cannot be created from can code', async () => {
+    const manager = newManager();
+    const can = await manager.create({ name: 'no-worker-ctor' });
+    await can.writeFile('/home/agent/ctor.js', `
+      try { console.log('global Worker', typeof Worker); } catch (e) { console.log('global Worker error', e.message); }
+      try { console.log('module.createRequire worker', typeof require('module').createRequire(__filename)('worker_threads').Worker); }
+      catch (e) { console.log('createRequire refused', String(e.message).slice(0, 60)); }
+    `);
+    const r = await can.exec('node ctor.js', { timeout: 30_000 });
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.match(r.stdout, /global Worker undefined/);
+    assert.doesNotMatch(r.stdout, /worker function|worker object/);
+    assert.match(r.stdout, /createRequire refused Cannot find module 'worker_threads'/);
   });
 });

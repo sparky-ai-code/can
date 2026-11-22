@@ -7,8 +7,8 @@ import { listMounts } from '../mounts.js';
 import { defaultTransferRoot, exportFromCan, importToCan, LIMITS, writeTransferFile } from '../transfer.js';
 import { pngSize } from '../browser/png.js';
 import { RENDER_LIMITS } from '../browser/render.js';
-import { describeReport, LIMITS as ENV_LIMITS } from '../environment.js';
-import { CI_LIMITS, describeCi, runCi } from '../ci.js';
+import { describeReport, LIMITS as ENV_LIMITS, shellQuote } from '../environment.js';
+import { CI_LIMITS, describeCi, pipelineLine, runCi } from '../ci.js';
 import { describeArgs, Recorder, summarizeResult } from '../recording.js';
 
 /** The environment argument of can_create (checked again by src/environment.js, which is the authority). */
@@ -68,10 +68,23 @@ export const ENVIRONMENT_SCHEMA = {
         additionalProperties: false,
       },
     },
+    tools: {
+      type: 'object',
+      description: 'Toolchains the can is built with, as name: version, such as {"python": "3.15"} (a prefix matches the newest '
+        + 'patch release). Resolved from the local toolchain cache when the can is created, and never downloaded: if one is '
+        + 'not installed, creation fails with the command that installs it. can_status shows the resolved version and sha256.',
+      additionalProperties: { type: 'string', minLength: 1 },
+    },
     requireTools: {
       type: 'array',
       items: { type: 'string', minLength: 1 },
       description: 'Commands that must exist in the can, such as ["npm", "pnpm"]. Creation fails with a clear message if one is missing.',
+    },
+    pip: {
+      type: 'array',
+      items: { type: 'string', minLength: 1 },
+      description: 'Lock lines, such as "requests==2.32.3 --hash=sha256:<hex>" (as can_install prints them), installed with pip '
+        + 'during setup, before the setup commands. Pure-Python packages only.',
     },
     setup: {
       type: 'array',
@@ -139,6 +152,28 @@ export function capText(text, limit = OUTPUT_LIMIT) {
 }
 
 const block = (text) => (text === '' || text === undefined ? '(empty)' : capText(text));
+
+const MB = 1024 * 1024;
+const INSTALL_TIMEOUT_MS = 300_000;
+const INSTALL_PACKAGES_MAX = 50;
+// A lock line as pip prints it: name==version --hash=sha256:<hex>.
+const LOCK_LINE = /^[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9.!+_-]+ --hash=sha256:[0-9a-f]{64}$/;
+// The state names can_status shows (interface I6): running is "ready".
+const STATE_LABEL = { running: 'ready', crashed: 'crashed', exited: 'stopped', 'memory-limit': 'memory-limit' };
+const MB_LIMIT = 700;
+const MB_SOFT = 630;
+
+/** The lines of an installer's output that carry its own CODE: ... Next: ... error, if it printed any. */
+function installerError(text) {
+  const found = text.split('\n').map((l) => l.trim()).filter((l) => /^[A-Z]{3,}: .*Next: /.test(l));
+  return found.length ? found[found.length - 1] : null;
+}
+
+/** Package name from a spec such as "lodash", "lodash@4.17.21" or "@scope/pkg@^1". */
+function npmPackageName(spec) {
+  const m = /^(@[^/]+\/[^@]+|[^@]+)(?:@.*)?$/.exec(spec);
+  return m ? m[1] : spec;
+}
 
 /** Trailing undefined arguments are dropped, so the VM sees them as absent, not as null. */
 const args = (...xs) => {
@@ -217,6 +252,74 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
 
   const snapshotOf = async (can) => capText(await browserFor(can).browse('snapshot'));
 
+  // Auto-save (interface I6): a call that changes a can saves it to disk before its result returns. A can that is not
+  // running has nothing new to save. A failed save is reported in the result, not hidden.
+  const autosave = async (can) => {
+    if (can.status !== 'running') return '';
+    try {
+      await registry.save(can.id);
+      return '';
+    } catch (err) {
+      return `\nauto-save failed: ${err.message}`;
+    }
+  };
+
+  // can_status: what a can is, from its live VM (or from its save, without booting it, when it is only on disk).
+  const statusText = async (ref) => {
+    const live = registry.manager.get(ref);
+    const saved = live ? null : registry.saved().find((s) => s.id === ref || s.name === ref);
+    if (!live && !saved) throw new KernelError('ENOENT', `ENOENT: no can "${ref}". Next: call can_list to see the cans, or can_create to make one.`);
+    const name = live ? live.name : saved.name;
+    const id = live ? live.id : saved.id;
+    const state = live ? STATE_LABEL[live.status] ?? 'stopped' : 'saved';
+    const lines = [`can "${name}" (id ${id})`, `state: ${state}${live ? '' : ' (on disk; it loads on first use, or call can_restart)'}`];
+
+    let memory = 'unavailable';
+    try {
+      const m = live && typeof live.memoryInfo === 'function' ? live.memoryInfo() : null;
+      if (m) {
+        memory = `${(m.usedBytes / MB).toFixed(1)} MB used, peak ${(m.peakBytes / MB).toFixed(1)} MB, `
+          + `limit ${MB_LIMIT} MB (soft ${MB_SOFT} MB), enforced by ${m.enforced}`;
+      }
+    } catch {
+      memory = 'unavailable';
+    }
+    lines.push(`memory: ${live ? memory : 'not loaded (no VM)'}`);
+
+    const toolchains = live ? live.toolchains ?? [] : saved.tools ?? [];
+    if (toolchains.length === 0) {
+      lines.push('tools: none declared in environment.tools');
+    } else {
+      lines.push('tools:');
+      for (const t of toolchains) lines.push(`  ${t.name} ${t.version} sha256 ${t.sha256 ?? 'unknown'}`);
+    }
+
+    if (live && live.status === 'running') {
+      const procs = await live.ps();
+      lines.push(procs.length ? `processes:\n${procs.map((p) => `  ${formatProcess(p)}`).join('\n')}` : 'processes: none');
+      const ports = await live.listeners();
+      lines.push(ports.length
+        ? `ports:\n${ports.map((l) => `  port ${l.port} (listening since ${new Date(l.createdAt).toISOString()})`).join('\n')}`
+        : 'ports: none');
+    } else {
+      lines.push('processes: none (the can is not running)');
+      lines.push('ports: none (the can is not running)');
+    }
+
+    lines.push(`startup sweep: removed ${registry.swept ?? 0} leftover file(s) from the store when this server started`);
+
+    let last = live ? registry.lastError(live.id) : null;
+    if (live && live.status === 'crashed') {
+      last = `EIO: the can's VM process exited unexpectedly. Next: call can_restart to start it from its last save.`;
+    } else if (live && live.status === 'memory-limit') {
+      last = `ENOMEM: can "${name}" used more than its ${MB_LIMIT} MB memory limit and was stopped. Its files from the last save are kept. `
+        + 'Next: call can_restart, then do less at once or split the work across cans.';
+    }
+    lines.push(`last error: ${last ?? 'none'}`);
+    if (live && live.status !== 'running' && !last) lines.push('Next: call can_restart to start it again from its last save.');
+    return lines.join('\n');
+  };
+
   const list = [
     // ---------------------------------------------------------------- cans
     tool(
@@ -225,8 +328,12 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
         'The can is saved to disk right away. Returns its name and id. Optionally mounts host folders the user ' +
         'has listed (see can_mounts): they are read-only inside the can, and they show their current contents. ' +
         'Pass environment to set the can up before it starts: environment variables, a start folder, network ' +
-        'access, host files or folders to copy in (with excludes, such as node_modules), files to write, commands ' +
-        'that must exist, and setup commands such as npm install. If a step fails, the can is not created.',
+        'access, host files or folders to copy in (with excludes, such as node_modules), files to write, toolchains ' +
+        '(tools, such as {"python": "3.15"}, from the local cache; never downloaded), pip lock lines, commands ' +
+        'that must exist, and setup commands such as npm install. If a step fails, the can is not created and nothing ' +
+        'is left behind. Calling again with the same name and the same environment is safe: it reuses the can ' +
+        '(a can that is not running is reported, and can_restart starts it again). A different environment under the ' +
+        'same name is EEXIST. A can that crashed or hit its memory limit is started again with can_restart.',
       {
         name: { type: 'string', description: 'Optional name (letters, digits, "_", "-", "."). Default: can-N.' },
         mounts: {
@@ -246,7 +353,13 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
       },
       [],
       async (a) => {
-        const can = await registry.create(a.name, { mounts: a.mounts ?? [], environment: a.environment });
+        const r = await registry.ensure(a.name, { mounts: a.mounts ?? [], environment: a.environment });
+        if (r.reused) {
+          if (r.state === 'running') return `can "${a.name}" already exists with the same spec; reused (id ${r.id}, state ready).`;
+          return `can "${a.name}" already exists with the same spec; not running (state: ${r.state}). `
+            + 'Next: call can_restart to start it from its last save.';
+        }
+        const { can } = r;
         const mounted = (a.mounts ?? []).map((m) => `${m.label} at ${m.canPath}`);
         const note = mounted.length ? ` Mounted read-only: ${mounted.join(', ')}.` : '';
         const setup = can.report ? `\n${describeReport(can.report)}` : '';
@@ -338,7 +451,13 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
         },
       },
       ['ci'],
-      async (a) => describeCi(await runCi(registry, a.ci, { transferRoot })),
+      async (a) => {
+        const report = await runCi(registry, a.ci, { transferRoot });
+        // The first line is the verdict (interface I6). A setup failure means no pipeline ran: an error result.
+        const text = `${pipelineLine(report)}\n${describeCi(report)}`;
+        if (report.setupFailed) throw new Error(text);
+        return text;
+      },
     ),
 
     tool(
@@ -368,7 +487,8 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
 
     tool(
       'can_destroy',
-      'Stop a can, kill its processes and delete its saved state. This cannot be undone.',
+      'Stop a can, kill its processes and delete its saved state. This cannot be undone, and the can\'s files are gone '
+        + 'for good. Works in any state: ready, crashed, memory-limit, or saved on disk only.',
       { can: canProp },
       ['can'],
       async (a) => {
@@ -386,14 +506,116 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
 
     tool(
       'can_save',
-      'Save a can\'s current filesystem and environment to disk so it survives a restart. ' +
-        'Processes and open ports are not saved. Running cans are also saved when the server shuts down cleanly.',
+      'Save a can\'s current filesystem and environment to disk now. Cans are already saved automatically after every ' +
+        'call that changes them (can_exec, can_spawn, can_write_file, can_import, can_kill, can_install and ' +
+        'browser_screenshot), so this is only needed to force a save before a risky step. Processes and open ports are ' +
+        'not saved. Running cans are also saved when the server shuts down cleanly.',
       { can: canProp },
       ['can'],
       async (a) => {
         const can = await registry.get(a.can);
         const file = await registry.manager.save(can.id);
         return `saved can "${can.name}" to ${file}`;
+      },
+    ),
+
+    tool(
+      'can_status',
+      'Show one can: its state (ready, crashed, stopped, memory-limit, or saved on disk), its memory use against the ' +
+        '700 MB limit, the toolchains it was created with (name, version, sha256), its processes and ports (as can_ps ' +
+        'and can_ports list them), the startup sweep count, and the last error with what to do next. A can that is only ' +
+        'on disk is described without starting it.',
+      { can: canProp },
+      ['can'],
+      async (a) => statusText(a.can),
+    ),
+
+    tool(
+      'can_restart',
+      'Start a can again from its last save. Use it for a can that crashed, was stopped, or hit its memory limit (see ' +
+        'can_status). A ready can is saved first, then stopped and loaded again. Files, environment variables and ' +
+        'toolchains come back from the save; processes and open ports do not, and the result says so.',
+      { can: canProp },
+      ['can'],
+      async (a) => {
+        const r = await registry.restart(a.can);
+        const iso = r.savedAt ? new Date(r.savedAt).toISOString() : 'an unknown time';
+        const was = r.was === 'running' ? ' (it was ready: saved first, then stopped and loaded again)' : ` (it was ${STATE_LABEL[r.was] ?? r.was})`;
+        return `can "${r.can.name}" restarted${was} from the save made at ${iso}. Processes and ports were not restored.`;
+      },
+    ),
+
+    tool(
+      'can_install',
+      'Install packages in a can with its own pip (pure-Python wheels only) or npm, the same as running "pip install" or ' +
+        '"npm install" in can_exec. Returns the exact versions that were installed: pip prints lock lines (name==version ' +
+        '--hash=sha256:<hex>) that can be pinned later with environment.pip; npm prints name@version and the integrity ' +
+        'from package-lock.json. A failed install is an error with the installer\'s own message. Packages are not ' +
+        'refused: any install the can\'s network policy allows runs.',
+      {
+        can: canProp,
+        manager: { type: 'string', enum: ['pip', 'npm'], description: 'pip or npm.' },
+        packages: {
+          type: 'array',
+          minItems: 1,
+          maxItems: INSTALL_PACKAGES_MAX,
+          items: { type: 'string', minLength: 1, description: 'A package name or spec, such as "requests==2.32.3" or "lodash@4".' },
+          description: `Packages to install (1 to ${INSTALL_PACKAGES_MAX}).`,
+        },
+      },
+      ['can', 'manager', 'packages'],
+      async (a) => {
+        if (a.packages.length < 1 || a.packages.length > INSTALL_PACKAGES_MAX) {
+          throw new KernelError('EINVAL', `EINVAL: packages takes 1 to ${INSTALL_PACKAGES_MAX} entries (got ${a.packages.length}). Next: split the list.`);
+        }
+        if (a.packages.some((p) => /[\r\n]/.test(p))) {
+          throw new KernelError('EINVAL', 'EINVAL: a package name must not contain a line break. Next: pass one package per entry.');
+        }
+        const can = await registry.get(a.can);
+        const quoted = a.packages.map(shellQuote).join(' ');
+        const command = `${a.manager} install ${quoted}`;
+        const r = await can.exec(command, { timeout: INSTALL_TIMEOUT_MS });
+        const note = await autosave(can);
+        const output = `${r.stdout ?? ''}\n${r.stderr ?? ''}`;
+        if (r.timedOut) {
+          throw new KernelError('ETIMEDOUT', `ETIMEDOUT: ${a.manager} install did not finish within ${INSTALL_TIMEOUT_MS} ms. Next: install fewer packages at once.`);
+        }
+        if (r.exitCode !== 0) {
+          const own = installerError(output);
+          if (own) throw new KernelError('EIO', own);
+          throw new KernelError(
+            'EIO',
+            `EIO: ${a.manager} install exited with code ${r.exitCode}. Next: check the package names and versions. Output:\n${capText(output, 2048)}`,
+          );
+        }
+        if (a.manager === 'pip') {
+          const locks = [...new Set(output.split('\n').map((l) => l.trim()).filter((l) => LOCK_LINE.test(l)))];
+          const body = locks.length ? locks.join('\n') : 'pip printed no lock lines; run "pip list" in can_exec to see the versions';
+          return `installed with pip in can "${can.name}":\n${body}${note}`;
+        }
+        const cwd = (await can.exec('pwd')).stdout.trim() || '/home/agent';
+        const rows = [];
+        let lock = null;
+        try {
+          lock = JSON.parse(String(await can.readFile(path.posix.join(cwd, 'package-lock.json'), 'utf8')));
+        } catch {
+          lock = null; // no lock file: versions come from node_modules below
+        }
+        for (const spec of a.packages) {
+          const name = npmPackageName(spec);
+          const entry = lock?.packages?.[`node_modules/${name}`];
+          if (entry?.version) {
+            rows.push(`${name}@${entry.version} ${entry.integrity ?? '(no integrity recorded)'}`);
+            continue;
+          }
+          try {
+            const pkg = JSON.parse(String(await can.readFile(path.posix.join(cwd, 'node_modules', name, 'package.json'), 'utf8')));
+            rows.push(`${name}@${pkg.version} (no integrity recorded)`);
+          } catch {
+            rows.push(`${name}: installed, version not found`);
+          }
+        }
+        return `installed with npm in can "${can.name}":\n${rows.join('\n')}${note}`;
       },
     ),
 
@@ -441,8 +663,9 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
     tool(
       'can_exec',
       'Run a shell command in the can and wait for it to finish. Supports pipes, &&, ||, redirects (> >> <), ' +
-        '$VAR, globs and NAME=value prefixes. Not supported: $(...), if/for loops, functions. ' +
-        'Returns the exit code, stdout and stderr (each capped at 20 KB). ' +
+        '$VAR, $(...), globs, NAME=value prefixes, if/then/else, for and while loops, functions and heredocs. ' +
+        'Not supported: case, ${VAR#pat} and other parameter expansions, [[ ]], and arrays. ' +
+        'Returns the exit code, stdout and stderr (each capped at 20 KB). The can is saved after the command. ' +
         'For a long-running server use can_spawn instead.',
       {
         can: canProp,
@@ -463,7 +686,8 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
           timeout: a.timeoutMs ?? EXEC_TIMEOUT_DEFAULT_MS,
         });
         const note = r.timedOut ? ' (timed out and was killed)' : r.signal ? ` (signal ${r.signal})` : '';
-        return `exit code: ${r.exitCode}${note}\n--- stdout ---\n${block(r.stdout)}\n--- stderr ---\n${block(r.stderr)}`;
+        const saved = await autosave(can);
+        return `exit code: ${r.exitCode}${note}\n--- stdout ---\n${block(r.stdout)}\n--- stderr ---\n${block(r.stderr)}${saved}`;
       },
     ),
 
@@ -476,7 +700,8 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
       async (a) => {
         const can = await registry.get(a.can);
         const v = await can.spawn(a.command, { cwd: a.cwd, background: true });
-        return `started ${formatProcess(v)}`;
+        const saved = await autosave(can);
+        return `started ${formatProcess(v)}${saved}`;
       },
     ),
 
@@ -524,7 +749,8 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
         const can = await registry.get(a.can);
         await can.kill(a.pid, a.signal ?? 'SIGTERM');
         const v = await can.getProcess(a.pid);
-        return `signalled ${v ? formatProcess(v) : `pid ${a.pid}`}`;
+        const saved = await autosave(can);
+        return `signalled ${v ? formatProcess(v) : `pid ${a.pid}`}${saved}`;
       },
     ),
 
@@ -574,14 +800,14 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
         if (a.encoding === 'base64') {
           const bytes = decodeBase64(a.content);
           await can.writeFile(a.path, bytes);
-          return `wrote ${bytes.length} bytes to ${a.path}`;
+          return `wrote ${bytes.length} bytes to ${a.path}${await autosave(can)}`;
         }
         // UTF-8 cannot hold a lone surrogate; writing it would silently store U+FFFD instead.
         if (!a.content.isWellFormed()) {
           throw new KernelError('EINVAL', 'EINVAL: content is not well-formed Unicode (a lone surrogate); use encoding "base64" for binary data');
         }
         await can.writeFile(a.path, a.content);
-        return `wrote ${Buffer.byteLength(a.content)} bytes to ${a.path}`;
+        return `wrote ${Buffer.byteLength(a.content)} bytes to ${a.path}${await autosave(can)}`;
       },
     ),
 
@@ -603,13 +829,14 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
       async (a) => {
         const can = await registry.get(a.can);
         let r;
+        let saved = '';
         try {
           r = await importToCan(can, a.hostPath, a.canPath, { overwrite: a.overwrite === true });
         } finally {
-          await registry.save(can.id); // a failed import can still have written some files
+          saved = await autosave(can); // a failed import can still have written some files
         }
         return `imported ${r.files} file(s), ${r.dirs} director${r.dirs === 1 ? 'y' : 'ies'}, ${r.bytes} bytes ` +
-          `from ${r.hostPath} to ${r.canPath}`;
+          `from ${r.hostPath} to ${r.canPath}${saved}`;
       },
     ),
 
@@ -869,18 +1096,15 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
         const { width, height } = pngSize(png);
         const stamp = new Date().toISOString().replace(/[:.]/g, '-');
         const canPath = path.posix.resolve('/home/agent', a.path ?? `/tmp/screenshots/${stamp}.png`);
-        try {
-          await can.mkdir(path.posix.dirname(canPath), { recursive: true });
-          await can.writeFile(canPath, png);
-        } finally {
-          await registry.save(can.id);
-        }
+        await can.mkdir(path.posix.dirname(canPath), { recursive: true });
+        await can.writeFile(canPath, png);
+        const saved = await autosave(can);
         let host = '';
         if (a.hostPath !== undefined) {
           const file = writeTransferFile(png, a.hostPath, { root: transferRoot, overwrite: a.overwrite === true });
           host = `\nhost: ${file}`;
         }
-        const text = `canPath: ${canPath}\nwidth: ${width}\nheight: ${height}\nbytes: ${png.length}${host}`;
+        const text = `canPath: ${canPath}\nwidth: ${width}\nheight: ${height}\nbytes: ${png.length}${host}${saved}`;
         if (png.length > INLINE_IMAGE_LIMIT) {
           return `${text}\nimage not included inline (over ${INLINE_IMAGE_LIMIT} bytes); read the file with can_export`;
         }
@@ -948,7 +1172,20 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
       },
     ),
   ];
-  return list.map(withTimeline);
+  // Each failed call is noted on its can, so can_status can show the last error (see CanRegistry.noteError).
+  const noteErrors = (t) => ({
+    ...t,
+    run: async (a) => {
+      try {
+        return await t.run(a);
+      } catch (err) {
+        const id = typeof a?.can === 'string' ? registry.manager.get(a.can)?.id : undefined;
+        if (id) registry.noteError(id, err.message);
+        throw err;
+      }
+    },
+  });
+  return list.map(withTimeline).map(noteErrors);
 
   /** Computer use needs real pointer and keyboard input, which only the Chromium backend has. */
   function computerBrowser(can) {

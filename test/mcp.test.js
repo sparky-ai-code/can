@@ -14,7 +14,7 @@ const MCP_BIN = path.resolve(TEST_DIR, '..', 'bin', 'can-mcp.js');
 const LONG = { timeout: 120_000 };
 
 const EXPECTED_TOOLS = [
-  'can_create', 'can_mounts', 'can_list', 'can_destroy', 'can_save', 'can_exec', 'can_spawn', 'can_ps', 'can_logs',
+  'can_create', 'can_mounts', 'can_list', 'can_status', 'can_restart', 'can_install','can_destroy', 'can_save', 'can_exec', 'can_spawn', 'can_ps', 'can_logs',
   'can_kill', 'can_read_file', 'can_write_file', 'can_list_dir', 'can_ports', 'can_http', 'can_import', 'can_export', 'can_ci',
   'browser_goto', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_select', 'browser_submit',
   'browser_text', 'browser_query', 'browser_back', 'browser_evaluate', 'browser_console', 'browser_screenshot',
@@ -273,14 +273,15 @@ describe('MCP server over stdio', LONG, () => {
         ],
       },
     });
-    assert.match(pass, /^CI "mcp-pass" passed/);
+    assert.equal(pass.split('\n')[0], 'pipeline: passed');
+    assert.match(pass, /^CI "mcp-pass" passed/m);
     assert.match(pass, /passed\s+compile exit 0/);
 
     const fail = await client.tool('can_ci', {
       ci: { jobs: [{ name: 'test', steps: [{ run: 'echo nope >&2; exit 5', label: 'unit' }, { run: 'echo after' }] }] },
     });
     assert.equal(fail.isError, false);
-    assert.match(fail.text, /^CI pipeline failed/);
+    assert.equal(fail.text.split('\n')[0], 'pipeline: failed at job "test", step "unit"');
     assert.match(fail.text, /failed\s+unit exit 5/);
     assert.match(fail.text, /\| nope/);
     assert.match(fail.text, /kept can "ci-/);
@@ -313,8 +314,11 @@ describe('MCP server over stdio', LONG, () => {
     assert.equal(await client.ok('can_ports', { can: 'web' }), 'no listening ports');
   });
 
-  test('can_create refuses a name that is in use; can_list shows the cans', async () => {
-    const dup = await client.tool('can_create', { name: 'web' });
+  test('can_create on a name in use: the same spec is reused, a different spec is EEXIST; can_list shows the cans', async () => {
+    const same = await client.tool('can_create', { name: 'web' });
+    assert.equal(same.isError, false);
+    assert.match(same.text, /already exists with the same spec; reused/);
+    const dup = await client.tool('can_create', { name: 'web', environment: { env: { OTHER: '1' } } });
     assert.equal(dup.isError, true);
     assert.match(dup.text, /EEXIST/);
 

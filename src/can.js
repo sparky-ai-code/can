@@ -1,7 +1,7 @@
 // Can: the host-side handle of one virtual machine. Every method is an async RPC to the can's own
 // child process (see vm/supervisor.js). The filesystem, network, processes and browser all live in
 // that child; this class only sends requests and decodes replies.
-import { VmProcess } from './vm/supervisor.js';
+import { VmProcess, softLimitError } from './vm/supervisor.js';
 import { KernelError } from './kernel/errors.js';
 import { attachEncoded, flattenEncoded, pagesFor } from './vm/snapshot-pages.js';
 
@@ -56,7 +56,8 @@ export class Can {
    * @returns {Promise<Can>}
    */
   static async open({ id, name, env, snapshot, layer2 = true, mounts = [], policy } = {}) {
-    const vm = await VmProcess.start({ layer2, mounts: mounts.map((m) => m.hostDir) });
+    const label = name ?? snapshot?.name ?? id;
+    const vm = await VmProcess.start({ layer2, mounts: mounts.map((m) => m.hostDir), label });
     try {
       const wire = mounts.map(({ label, canPath, hostDir }) => ({ label, canPath, hostDir }));
       const meta = snapshot
@@ -77,12 +78,30 @@ export class Can {
     this.policy = meta.policy ?? null; // network and runtime settings (see vm/policy.js)
   }
 
-  /** 'running' | 'crashed' | 'destroyed' */
+  /**
+   * 'running' | 'exited' | 'crashed' | 'memory-limit' | 'destroyed' (interface I4). 'destroyed' is a can stopped on
+   * purpose (destroy, stop, or a host shutting down). 'exited' is reserved for a VM that ended without being asked.
+   */
   get status() {
     const s = this._vm.status;
-    if (s === 'crashed') return 'crashed';
-    if (s === 'running') return 'running';
-    return 'destroyed';
+    if (s === 'running' || s === 'exited' || s === 'crashed' || s === 'memory-limit') return s;
+    return 'destroyed'; // stopping or destroyed on purpose
+  }
+
+  /**
+   * Memory of this can, measured on its child process: {usedBytes, peakBytes, softBytes, limitBytes, enforced}.
+   * limitBytes is 700 MB and softBytes 630 MB (1 MB = 1024 * 1024 bytes). enforced is 'job-object' when the Windows
+   * helper holds the hard limit, else 'sampled' (see src/vm/memcap.js).
+   */
+  memoryInfo() {
+    return this._vm.memoryInfo();
+  }
+
+  /** Refuses new work while the can is at or above its soft limit (kill still works). See softLimitError. */
+  _checkSoftLimit() {
+    if (this._vm.status !== 'running') return;
+    const m = this._vm.memoryInfo();
+    if (m.usedBytes >= m.softBytes) throw softLimitError(this.name ?? this.id, m.usedBytes);
   }
 
   /** PID of the can's VM process (for diagnostics only; it is not a can pid). */
@@ -91,12 +110,14 @@ export class Can {
   // ---- commands and processes
 
   /** Foreground run. Resolves to {exitCode, signal, stdout, stderr, timedOut}. */
-  exec(command, opts = {}) {
+  async exec(command, opts = {}) {
+    this._checkSoftLimit();
     return this._vm.request('exec', { command, opts: wireOpts(opts) });
   }
 
   /** Starts a process and returns its view immediately. See ProcessTable.spawn. */
-  spawn(command, opts = {}) {
+  async spawn(command, opts = {}) {
+    this._checkSoftLimit();
     return this._vm.request('spawn', { command, opts: wireOpts(opts) });
   }
 
@@ -225,6 +246,7 @@ export class Can {
   async restore(snapshot) {
     const meta = await pushSnapshot(this._vm, snapshot, []);
     this.name = meta.name;
+    this._vm.label = meta.name;
     return meta;
   }
 

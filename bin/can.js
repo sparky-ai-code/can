@@ -14,6 +14,10 @@ import { describeReport } from '../src/environment.js';
 import { describeCi, normalizeCi, runCi } from '../src/ci.js';
 import { KernelError } from '../src/kernel/errors.js';
 import { ChromiumBrowsers } from '../src/canchromium.js';
+import {
+  bundleDir, cacheDir, configFilePath, configuredSource, fetchTools, listTools, mirrorTools, parseSource,
+  setConfiguredSource, verifyTools,
+} from '../src/toolchains.js';
 
 /**
  * The browser a CLI command uses on one can: a real Chromium (the default), or the can's built-in browser when the
@@ -55,6 +59,14 @@ const USAGE = `usage: can <command> [args]
   can prune [--older-than <hours>] [--dry-run]
                                            delete kept CI cans (saved cans named ci-*, created before the age; default 24
                                            hours). A failed run keeps its can for inspection until this removes it.
+  can tools list                           the tools in toolchains.lock.json, and whether each is bundled or cached
+  can tools fetch [--source github|<url>] [--from <dir>] [--into <dir>] [name...]
+                                           download, verify and unpack tools (opt-in; nothing else downloads). --from
+                                           uses <dir>/<file> when it is there. --into sets the folder (default ~/.can/toolchains)
+  can tools mirror <dir> [--source github|<url>]
+                                           download every tool archive into <dir>, verified, to serve from a mirror
+  can tools verify                         re-hash the bundled and cached copies against their manifests
+  can tools source [github|<url>]          show or set the default fetch source in ~/.can/config.json (CAN_CONFIG_FILE)
   can mcp                                  run the MCP server on stdin/stdout
   can help                                 show this help
 
@@ -170,6 +182,81 @@ async function transfer(reg, rest, mode) {
   process.stdout.write(`copied ${r.bytes} bytes (${r.files} file(s), ${r.dirs} dir(s)) from ${from.can}:${r.canPath} to ${r.hostPath}\n`);
   if (r.skipped) process.stderr.write(`note: skipped ${r.skipped} symbolic link(s) inside the can\n`);
   return 0;
+}
+
+const TOOLS_USAGE = 'usage: can tools list | fetch [--source github|<url>] [--from <dir>] [--into <dir>] [name...] | mirror <dir> [--source github|<url>] | verify | source [github|<url>]';
+
+/** Parses the words after `can tools`. Fetching and mirroring happen only when one of these subcommands runs. */
+async function toolsCommand(rest) {
+  const [sub, ...args] = rest;
+  if (sub === 'list') {
+    if (args.length) throw new UsageError('usage: can tools list');
+    const rows = listTools().map((t) => [t.name, t.version, t.file, t.size, [t.bundled && 'bundled', t.cached && 'cached'].filter(Boolean).join(', ') || 'no']);
+    printTable(['NAME', 'VERSION', 'FILE', 'SIZE', 'PRESENT'], rows);
+    return 0;
+  }
+  if (sub === 'fetch' || sub === 'mirror') {
+    const o = { source: undefined, from: undefined, into: undefined, names: [] };
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      const value = () => {
+        if (i + 1 >= args.length) throw new UsageError(`${a} needs a value`);
+        i++;
+        return args[i];
+      };
+      if (a === '--source') o.source = value();
+      else if (sub === 'fetch' && a === '--from') o.from = value();
+      else if (sub === 'fetch' && a === '--into') o.into = value();
+      else if (a.startsWith('--')) throw new UsageError(`unknown option ${a}`);
+      else o.names.push(a);
+    }
+    if (sub === 'mirror') {
+      if (o.names.length !== 1) throw new UsageError('usage: can tools mirror <dir> [--source github|<url>]');
+      const source = o.source === undefined ? 'github' : parseSource(o.source);
+      for (const r of await mirrorTools(o.names[0], { source })) {
+        process.stdout.write(`${r.status === 'present' ? 'already present' : 'mirrored'} ${r.name} ${r.version}: ${r.file}\n`);
+      }
+      return 0;
+    }
+    const source = o.source === undefined ? configuredSource() : parseSource(o.source);
+    for (const r of await fetchTools({ source, names: o.names, into: o.into, from: o.from })) {
+      process.stdout.write(`${r.status === 'present' ? 'already present' : 'fetched'} ${r.name} ${r.version}: ${r.dir}\n`);
+    }
+    return 0;
+  }
+  if (sub === 'verify') {
+    if (args.length) throw new UsageError('usage: can tools verify');
+    const results = await verifyTools();
+    if (results.length === 0) {
+      process.stdout.write(`no tools are present (bundled: ${bundleDir()}, cache: ${cacheDir()}). Next: can tools fetch\n`);
+      return 0;
+    }
+    let failed = 0;
+    for (const r of results) {
+      if (r.ok) process.stdout.write(`ok ${r.where} ${r.name} ${r.version} (${r.files} files): ${r.dir}\n`);
+      else {
+        failed++;
+        process.stdout.write(`FAILED ${r.where} ${r.name} ${r.version}: ${r.dir}: ${r.problems.join('; ')}\n`);
+      }
+    }
+    if (failed) {
+      process.stderr.write(`EINTEGRITY: ${failed} copy(ies) do not match their manifests. Next: delete the FAILED folder(s) and run can tools fetch <name>\n`);
+      return 1;
+    }
+    return 0;
+  }
+  if (sub === 'source') {
+    if (args.length > 1) throw new UsageError('usage: can tools source [github|<url>]');
+    if (args.length === 0) {
+      const s = configuredSource();
+      process.stdout.write(`${s}${s === 'github' ? ' (default)' : ''}\n`);
+      return 0;
+    }
+    const s = setConfiguredSource(args[0]);
+    process.stdout.write(`fetch source set to ${s} in ${configFilePath()}. Only can tools fetch and mirror use it.\n`);
+    return 0;
+  }
+  throw new UsageError(TOOLS_USAGE);
 }
 
 const commands = {
@@ -417,6 +504,10 @@ const commands = {
     }
     rl.close();
     await reg.save(can.id);
+  },
+
+  async tools(reg, rest) {
+    return toolsCommand(rest);
   },
 
   async mcp(reg) {

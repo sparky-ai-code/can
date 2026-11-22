@@ -56,6 +56,13 @@ src/runtime/modules.js   virtual fs, path, child_process, os, process, ...      
 src/runtime/http.js      virtual http/https over vnet (outbound via node)       [impl]
 src/browser/             headless virtual browser                              [impl]
 src/mcp/server.js        MCP stdio JSON-RPC server            [impl]
+src/toolchains.js        tool lock, resolve (never downloads), fetch, mirror, verify (section 11.3) [impl]
+toolchains.lock.json     the tools: name, version, size, sha256, GitHub source [impl]
+src/vm/memcap.js         memory monitor for one can process: Job Object helper or sampling (section 9.1) [impl]
+native/win/              Windows memory helper: CanMemcap.cs, build.js, build.cmd (section 9.1) [impl]
+src/runtime/wasi/        WebAssembly tier: run.js, wasm-worker.js, vfsfs.js, memlimit.js (section 11.1) [impl]
+src/vendor/browser_wasi_shim/  vendored @bjorn3/browser_wasi_shim 0.4.2, integrity checked (VENDOR.md) [impl]
+src/runtime/pip.js       pip for a can: pure-Python wheels, sha256, lock lines (section 11.2) [impl]
 test/kernel.test.js      vfs, vnet, proc, Machine, CanManager lifecycle
 test/runtime.test.js     shell, JS runtime, background servers, browser inside a can
 test/browser.test.js     HTML parser, selectors, cookies, browser (mock vnet and loopback internet)
@@ -65,6 +72,13 @@ test/cli.test.js         CLI smoke tests: create, exec, cp, shell, mcp
 test/transfer.test.js    import and export: round trips, refusals, limits, MCP and CLI transfer
 test/e2e.test.js         an agent builds, runs and tests a multi-file web app through MCP [impl]
 test/isolation.test.js   listen guard, leaked host net, two cans side by side, heap cap, default timeout [impl]
+test/memcap.test.js      memory monitor: helper, sampling, limit events [impl]
+test/memory-limit.test.js hard and soft limits, memory-limit status, can_restart after a limit [impl]
+test/stuck.test.js       stuck watchdog: busy loop stopped, others unaffected [impl]
+test/wasi.test.js        WASI runner: memlimit rewrite, file adapter, exit codes, memory limit, CPython -c [impl]
+test/python.test.js      python and pip in a can, cwd handling, lock lines [impl]
+test/toolchains.test.js  lock, resolve order, fetch and mirror checks, verify [impl]
+test/mcp-*.test.js       can_status, can_restart, can_install, can_create idempotence, can_ci [impl]
 ```
 
 ## 3. VFS (`src/kernel/vfs.js`) [impl]
@@ -169,7 +183,12 @@ Fields: `id`, `name`, `vfs`, `vnet`, `proc`, `env`, `createdAt`.
 Host-side handle of one can. Every method is an async RPC to that can's VM process (section 9).
 Created by `CanManager`; `Can.open({id, name, env, snapshot, layer2})` starts a VM directly.
 
-- Identity: `id`, `name`, `createdAt`, `status` (`'running' | 'crashed' | 'destroyed'`), `vmPid` (the VM process).
+- Identity: `id`, `name`, `createdAt`, `status` (`'running' | 'exited' | 'crashed' | 'memory-limit' | 'destroyed'`), `vmPid` (the VM process).
+  `exited` is a VM that ended without being asked; `crashed` covers a crash and a stuck-watchdog stop (section 9); `memory-limit`
+  is a stop at the hard limit (section 9.1); `destroyed` is a stop on purpose (destroy, stop, or host shutdown).
+- Memory: `memoryInfo()` returns `{usedBytes, peakBytes, softBytes, limitBytes, enforced}` (`enforced` is `'job-object'` or
+  `'sampled'`). Limits: 700 MB hard, 630 MB soft (section 9.1). `_checkSoftLimit` makes `exec` and `spawn` reject with ENOMEM
+  at or above the soft limit; `kill` and the other calls still work.
 - Commands: `exec(command, opts)`, `spawn(command, opts)` (returns the view), `wait(pid, timeoutMs)`,
   `kill(pid, signal)`, `ps({status})`, `getProcess(pid)`, `logs(pid, 'stdout'|'stderr') -> Buffer`,
   `writeStdin(pid, data)`, `endStdin(pid)`.
@@ -204,10 +223,16 @@ layer-1-only test (section 10.4). `DEFAULT_ENV` holds HOME=/home/agent, USER, SH
 
 **Start** (`src/vm/supervisor.js`). Each can is `child_process.fork(src/vm/worker.js)` with:
 
-- `execArgv`: `--permission`, `--allow-fs-read=<absolute src directory>`, `--max-old-space-size=512` (the heap cap
-  of one can, since can code runs in this process), and, with layer 2, `--disallow-code-generation-from-strings`.
-  Nothing else is granted: no `--allow-fs-write`,
-  `--allow-child-process`, `--allow-worker`, `--allow-addons`, `--allow-wasi`, `--allow-inspector`.
+- `execArgv` (`vmExecArgv` in `supervisor.js`, which tests can read):
+  - `--permission`.
+  - `--allow-fs-read=<absolute src directory>`, then one `--allow-fs-read` for each toolchain folder (the bundled
+    `<app>/toolchains` and the cache `~/.can/toolchains`, or `CAN_TOOLCHAIN_DIR`), one for the tool lock file
+    (`toolchains.lock.json`, read by `resolveTool`), and one for each mounted host folder (section 13.2). All are read only.
+  - `--max-old-space-size=600` (`VM_HEAP_MB`): the JavaScript heap cap of one can, since can code runs in this process.
+  - `--allow-worker`: WebAssembly programs run in worker threads (section 11.1). This is the one allow flag beyond the reads.
+  - with layer 2, `--disallow-code-generation-from-strings`.
+  Nothing else is granted: no `--allow-fs-write`, `--allow-child-process`, `--allow-addons`, `--allow-wasi` or
+  `--allow-inspector`. Section 10.4 item 10 covers `--allow-worker`.
 - `env: {}`, `stdio: ['ignore', 'ignore', 'pipe', 'ipc']`, `serialization: 'json'`, `cwd` = src directory.
   libuv still copies Windows system variables (USERPROFILE, PATH, SYSTEMROOT, ...) into any child env,
   so `worker.js` deletes every `process.env` key before any other code runs.
@@ -226,6 +251,51 @@ so nothing but plain data leaves the VM.
 - `shutdown` destroys the machine and the VM process exits after replying. `destroy()` falls back to SIGKILL after 3 s.
 - If the VM exits unexpectedly, every pending and later call rejects with `ECHILD` naming the pid, exit
   code, signal and the last stderr. `can.status` becomes `'crashed'`. The name stays reserved until destroyed.
+  Two stops have their own status and error: a hard memory stop sets `'memory-limit'` (ENOMEM, section 9.1), and a stuck
+  stop sets `'crashed'` with ETIMEDOUT (section 9.2). A VM whose heap runs out prints V8's heap-limit text on stderr; the
+  supervisor reads it and reports `'memory-limit'` rather than `'crashed'`.
+- **Restart.** A can in any stopped state can be loaded again from its last save (`CanRegistry.restart`, `can_restart`).
+  Processes and ports do not come back.
+
+### 9.1 Memory monitor and the native helper (`src/vm/memcap.js`, `native/win/`) [impl]
+
+Each can has one memory limit, measured on its child process (owner decision 11 of the design doc). Constants in
+`supervisor.js`: hard limit `CAN_LIMIT_MB = 700`, soft limit `CAN_SOFT_MB = 630` (1 MB = 1024 * 1024 bytes), and the V8
+heap cap `VM_HEAP_MB = 600`. `startMemoryMonitor(pid, {limitBytes, softBytes, onSample, onLimit})` returns
+`{stop(), enforced, report(bytes)}`.
+
+- **Windows.** `startMemoryMonitor` starts `can-memcap.exe <pid> <limitBytes>` (`helperPath()` looks in
+  `<app>/native/win/` and `native/win/build/`). The helper (`CanMemcap.cs`, built by `build.js` with the .NET Framework
+  `csc.exe` that ships with Windows) puts the process in a Job Object with `ProcessMemoryLimit` set, and prints one JSON line
+  per 250 ms: `{"private":<bytes>,"peak":<bytes>}`. It prints `{"event":"ready","job":true|false}` after setup, and
+  `{"event":"limit"}` once when the job reports the limit was reached. The helper never kills the process; the parent
+  does. `enforced` is `'job-object'` only when `ready` says `job:true`. If the helper is missing, fails, or
+  `CAN_MEMCAP_DISABLE_HELPER=1` is set, the monitor runs a PowerShell loop that samples `PrivateMemorySize64` once a second,
+  and `enforced` stays `'sampled'`.
+- **macOS.** `ps -o rss= -p <pid>` once a second, in KiB. The child reports its own `process.memoryUsage().rss` over IPC every
+  250 ms (`worker.js`, `MEMORY_REPORT_MS`, through `report(bytes)`), and the larger value is used. This is sampling only, so the
+  limit can be overshot by one interval's allocation.
+- **Linux.** `/proc/<pid>/status` `VmRSS` once a second. Sampling only, like macOS, without the child's own report.
+- **Events.** `onSample(bytes)` runs on every reading. `onLimit()` runs once, when a reading reaches `limitBytes` or the helper
+  reports `limit`. The supervisor then sets status `'memory-limit'` and kills the child (`_memoryLimit`). The monitor itself
+  never kills anything.
+- **Soft limit.** Soft is informational in the monitor. `Can` refuses `exec` and `spawn` at or above `softBytes`
+  (`_checkSoftLimit`, `softLimitError`, ENOMEM with a next step).
+- **Scope.** The monitor measures the can's child process only. Chrome and Edge run as separate host processes (`hostbrowser.js`,
+  `canchromium.js`) and are not counted.
+- **Reporting.** `can.memoryInfo()` returns `{usedBytes, peakBytes, softBytes, limitBytes, enforced}` and `can_status`
+  shows it. The supervisor's `memory` record keeps the last and peak reading.
+
+### 9.2 Stuck watchdog (`src/vm/supervisor.js`) [impl]
+
+A VM that keeps the CPU busy cannot answer its memory reports, so silence is the signal. The supervisor records the time of
+each message from the child (`lastSeen`) and checks once a second (`STUCK_CHECK_MS`). When requests are pending and nothing
+has arrived for longer than `max(10 s, longest pending timeout + 5 s)`, the VM is busy-looping: the supervisor sets
+`_stuck = stuckError(label)` (ETIMEDOUT, with a next step), sets status `'crashed'` and kills the child. Silence is counted from
+the later of the last message and the oldest pending request, so a request sent to an idle VM gets its full allowance.
+`CAN_STUCK_IDLE_MS` overrides the 10 s idle time for tests.
+
+## 10. Security model [impl]
 - The VM stops when the host exits. Two mechanisms: the host kills its VMs in a `process 'exit'` handler,
   and the VM exits on IPC `disconnect` (covers a host that is killed without running exit handlers).
 
@@ -237,7 +307,10 @@ so nothing but plain data leaves the VM.
   (`--allow-fs-write` absent). Verified on Node 24.15.0: `require('fs')`, `process.getBuiltinModule('fs')`
   and `process.binding('fs')` all fail with `ERR_ACCESS_DENIED` for `C:/Windows/win.ini`, and writes fail.
 - Host processes: denied. `child_process`, `spawnSync`, `process.binding('spawn_sync')` fail with `ERR_ACCESS_DENIED`.
-- Workers, addons, inspector: denied (`ERR_ACCESS_DENIED`, `ERR_DLOPEN_DISABLED`). WASI is not granted; not tested.
+- Workers: allowed by `--allow-worker` (section 9), so that WebAssembly programs can run in a worker thread. Layer 1 was
+  still tested as denying file reads and child processes inside such a worker on Node 24 (`test/vm.test.js`, "a worker
+  thread started inside the VM process is still denied"); see item 10 of section 10.4.
+- Addons and inspector: denied (`ERR_DLOPEN_DISABLED`, `ERR_ACCESS_DENIED`). `--allow-wasi` is not granted (`node:wasi` is not used).
 - Host environment: the VM's `process.env` is empty after boot. One exception, at the OS level only: `SYSTEMROOT` is
   kept on Windows (section 10.1a).
 - **10.1a SYSTEMROOT and DNS.** Windows resolves host names (`getaddrinfo`) through `%SYSTEMROOT%`. Before this
@@ -309,10 +382,12 @@ so nothing but plain data leaves the VM.
    runs (its imports load first). No can code runs in that window.
 5. **Verified on Node 24.15.0 only.** `package.json` still declares `engines: >=20`; the permission flags
    were not tested on other versions.
-6. **Memory is capped, CPU is not.** Each can VM has a 512 MB V8 old-space cap (`--max-old-space-size=512`). A
-   can that exceeds it crashes alone (`ECHILD`, other cans run on). The cap covers the JS heap only, so the process
-   can use somewhat more in total. A synchronous infinite loop in can code still blocks that can's VM event loop
-   (the host stays responsive, and `destroy` kills the VM). Foreground commands time out after 60 s by default.
+6. **Memory is capped, CPU is not.** Each can has a 700 MB hard limit on its child process, measured by the monitor
+   (section 9.1), and a 600 MB V8 old-space cap (`--max-old-space-size=600`). A can past the hard limit is stopped alone
+   (`memory-limit`, ENOMEM); one past the heap cap crashes alone (`ECHILD`, other cans run on). On Windows the limit is
+   enforced by a Job Object; on macOS and Linux it is sampled, so it can be overshot by one interval's allocation. A
+   synchronous infinite loop in can code blocks that can's VM event loop until the stuck watchdog stops it after about
+   10 s (section 9.2). The host stays responsive, and `destroy` kills the VM. Foreground commands time out after 60 s by default.
    Browser page scripts are cut off by `scriptTimeout`. Each can is one OS process.
 7. **Crash loses memory state.** A crashed can's unsaved state is gone; `load` restores the last `save`.
 8. **Mounted host folders are readable by the VM process.** Each mount adds `--allow-fs-read=<folder>` (no write
@@ -320,6 +395,12 @@ so nothing but plain data leaves the VM.
    folder's contents are read live, so a can sees what the user changes there.
 9. **The host browser (opt-in, section 13.2) is not sandboxed.** It is a real Chrome or Edge on the host, with the
    host's network. It can reach localhost services. It is off unless the user sets `"hostBrowser": true`.
+10. **Worker threads (`--allow-worker`).** The flag lets a can start worker threads, which WebAssembly programs need
+    (section 11.1). Node documents that the permission model does not carry over to a worker's own permissions, so code
+    that escapes layer 2 could start a worker that runs outside the membrane. Layer 1 is still the check: the test
+    "a worker thread started inside the VM process is still denied" (`test/vm.test.js`) starts a worker from the real
+    flags and shows it refused a host file read and a host shell. Verified on Node 24.15.0 only; Node 20 is not tested.
+    The worker still runs inside the can's own child process, so a memory or CPU limit on that process still applies.
 
 ## 11. Runtime [impl]
 
@@ -336,7 +417,7 @@ so nothing but plain data leaves the VM.
   so the returned pid is the job itself.
   Builtins: cd pwd ls cat echo printf mkdir rm cp mv touch env export unset set shift return break continue local read
   eval source . sh bash test [ expr seq basename dirname tr cut date diff tee xargs which ps kill sleep jobs grep head
-  tail wc find sed (s/// only) sort uniq true false : exit node npm curl help. `set -e` stops on a failing command.
+  tail wc find sed (s/// only) sort uniq true false : exit node npm curl python python3 pip pip3 help. A command whose path ends in `.wasm` runs as a WASI program (section 11.1). `set -e` stops on a failing command.
   `sh file`, `bash file` and `./file.sh` (a `.sh` name or a sh/bash shebang) run a script from the VFS in a fresh shell.
   `echo` takes `-n` and `-e` (backslash escapes). `printf` supports `%s %d %i %f %x %o %c %%`, width, precision,
   `-` alignment, and reuses its format while arguments remain. `/dev/null` works in redirects. Pipelines run their
@@ -364,6 +445,71 @@ so nothing but plain data leaves the VM.
   status 1 and says it needs the asynchronous shell),
   crypto, stream, querystring, string_decoder, assert. Any other module, including `net`, `worker_threads`,
   `dgram`, `vm` and `inspector`, throws MODULE_NOT_FOUND with an explanation.
+
+### 11.1 WebAssembly tier (`src/runtime/wasi/`) [impl]
+
+- **Entry.** `runWasm({bytes | path, args, env, cwd, vfs, stdin, stdout, stderr, preopens, memoryLimitBytes})` (`run.js`)
+  resolves to an exit code. It runs in the can's child process, in the main realm, not in the can's vm context.
+  `runPython` (section 11.2) calls it. `shell.js` sends any command whose path ends in `.wasm` to `runWasmFile`.
+- **Worker thread.** Each program runs in its own `worker_threads` Worker (`wasm-worker.js`, JS heap 64 MB). The program's
+  memory is a WebAssembly memory outside that heap. Stopping the worker (`terminate()`) is how a kill or an exec timeout ends
+  a program that never returns. The worker is allowed by `--allow-worker` (section 9, section 10.4 item 10).
+- **VFS proxy.** The can's files stay on the child's main thread. The worker asks for each file call through a message
+  channel, and `vfsfs.js` implements the shim's file and directory objects over the can VFS, so writes land in the can and
+  survive a save. Host overlays, such as the Python stdlib folder, are read by the worker directly and never written. An open
+  file buffers its writes and flushes them on close, `fd_sync`, path operations and program end.
+- **Shim.** `src/vendor/browser_wasi_shim/` is `@bjorn3/browser_wasi_shim` 0.4.2: the built ESM files, unchanged, with its
+  licences. `VENDOR.md` records the npm sha512 integrity that was checked before copying. No npm dependency was added.
+- **Memory** (`memlimit.js`). Before a module compiles, each memory it defines or imports has its maximum set to the allowed
+  maximum, 11200 pages (700 MB, the can's limit). A grow past the limit (`RangeError`, or a trap at or above 90% of the limit)
+  exits 137 with stderr `ENOMEM: wasm memory limit reached. Next: do less at once.` Any other trap exits 134 with `TRAP:`.
+- **Exit codes.** The program's own code from `proc_exit`; 137 for the memory limit or SIGKILL; 143 for SIGTERM; 134 for other
+  traps; 5 when a file the program wrote could not be saved at its end.
+- **Not supported.** `path_symlink` (`os.symlink` gives ENOTSUP). WASI preview 1 has no sockets and no process spawning.
+  Rust is not compiled in a can (owner decision 1): the tier runs prebuilt `wasm32-wasip1` programs only.
+
+### 11.2 Python and pip (`src/runtime/pip.js`, `src/runtime/builtins.js`) [impl]
+
+- **python, python3** (`builtins.js`): run `python.wasm` through `runPython` (`run.js`), which resolves the bundled CPython
+  3.15.x with `resolveTool('python', '3.15')` (section 11.3), and passes `PYTHONHOME=/usr`,
+  `PYTHONPATH=/usr/lib/python3.15/site-packages`, `PYTHONDONTWRITEBYTECODE=1` and `PYTHONIOENCODING=utf-8`. Python sees the can
+  VFS as `/`. WASI has no working directory, so a relative script path is made absolute against the can's cwd, and a
+  `sitecustomize.py` in site-packages changes to `PWD` at start-up.
+- **pip** (`pip.js`, `builtins.js`): `pip install <spec>...`, `pip install -r <file>` (with `--hash=` words attached to the spec
+  they follow), `pip list` and `pip --version`. Other subcommands are EINVAL. Specs accept names, `==`, ranges, markers and
+  extras (extras ignored).
+- **Plan, then write.** Every distribution is resolved, downloaded and checked before any file is written, so a bad hash or a
+  missing wheel leaves site-packages unchanged. Only `py3-none-any` and `py2.py3-none-any` wheels install. An sdist or a
+  platform wheel is ENOTSUP. A wheel that uses zip64 or a compression method other than stored or deflate is ENOTSUP too.
+- **Checks.** Each wheel's sha256 is compared with PyPI's `digests.sha256` (JSON API), or with the hash in the lock line when
+  one is given (`EINTEGRITY` on mismatch, EINVAL for a malformed hash). Unpacking uses a small zip reader on `node:zlib`.
+- **Lock lines.** pip prints `name==version --hash=sha256:<hex>` for each distribution it installs. `can_install` returns these
+  lines, and `environment.pip` (section 14) installs them during setup.
+- **Index and network.** `CAN_PIP_INDEX` names the JSON index (default `https://pypi.org/pypi/`). Requests use the host network
+  only when the can's `network.internet` is on; otherwise they fail with EPERM, as npm does.
+
+### 11.3 Toolchains (`src/toolchains.js`, `bin/can.js tools`) [impl]
+
+- **Lock.** `toolchains.lock.json` at the app root (`lockVersion: 1`) lists entries `{name, version, target, file, size, sha256,
+  sources: {github}}`. `lockEntries()` reads it (`CAN_TOOLCHAIN_LOCK` overrides the path). The one entry is CPython 3.15.2 for
+  `wasm32-wasip1`.
+- **Resolve, never download.** `resolveTool(name, versionSpec)` returns `{name, version, dir}`. A spec `"3.15"` matches the one
+  entry whose version starts with `3.15.`; an exact version must match exactly. The lookup is `<app>/toolchains/<sha256>/` (the
+  bundled copy, `CAN_TOOLCHAIN_BUNDLE_DIR` overrides), then `~/.can/toolchains/<sha256>/` (`CAN_TOOLCHAIN_DIR` overrides). Errors
+  have a next step: ENOENT for an unknown name or a copy that is not installed (`can tools fetch <name>`), and ENOTSUP for a
+  version the lock does not have.
+- **Fetch (opt-in).** `fetchTools({source, names, into, from})`, run only by `can tools fetch`. The source is `github` (the lock's
+  URL) or a mirror base URL, where each archive is `<base>/<file>`. The default source is kept in `~/.can/config.json` as
+  `toolchainSource` (`can tools source`; `CAN_CONFIG_FILE` overrides the path). The archive is downloaded to a temporary file,
+  checked for size and sha256, unpacked into a staging folder and renamed into place. A failed fetch deletes its temporary file.
+  `--from <dir>` uses `<dir>/<file>` when it is present.
+- **Mirror.** `mirrorTools(dir, {source})`, run by `can tools mirror`, downloads every entry, verified, into a folder that a
+  user can host. Entries already present are reported as such.
+- **Manifest and verify.** An unpacked copy has `.can-manifest.json` with the sha256 of each file. `verifyTools()`, run by
+  `can tools verify`, re-hashes every bundled and cached copy and reports EINTEGRITY for a mismatch.
+- **Child process.** The bundled and cache folders and the lock file are readable by the can process (section 9).
+- **Packaging.** `packaging/stage.mjs` runs `can tools fetch --source github --into <app>/toolchains` at build time, or copies from
+  `--toolchains-from <dir>`, so the installers bundle the tools. Nothing fetches at install time or on first run.
 
 ## 12. Browser (`src/browser/`) [impl]
 
@@ -448,15 +594,16 @@ Files: `html.js` (tolerant parser and DOM), `selector.js` (CSS selectors, `findB
   notifications are never answered; unknown methods get -32601. Tool errors are results with isError:true. Output is
   capped at about 20 KB, keeping the head and the tail. Stdout carries protocol messages only. Stdin closing or SIGINT
   and SIGTERM saves running cans and stops their VMs. Browser tools reach the internet by default (section 12).
-  Tools: can_create (with optional `mounts`), can_mounts, can_list, can_destroy, can_save, can_exec,
-  can_spawn, can_ps, can_logs, can_kill, can_read_file, can_write_file, can_import, can_export, can_list_dir, can_ports, can_http, and
+  Tools: can_create (with optional `mounts`, `environment`), can_mounts, can_list, can_destroy, can_save, can_status, can_restart,
+  can_install, can_exec, can_spawn, can_ps, can_logs, can_kill, can_read_file, can_write_file, can_import, can_export, can_list_dir,
+  can_ports, can_http, can_ci, can_record_start, can_record_stop, and
   (only when the user enables the host browser, section 13.2) host_browser_goto, _text, _evaluate, _screenshot, _close.
   The host browser tools use `src/hostbrowser.js`, outside any can.
   browser_goto, _snapshot, _click, _type, _select, _submit, _text, _query, _back, _evaluate, _console, _screenshot. Navigation
   and click or submit tools return the new snapshot. `browser_screenshot` returns text plus an image content block
   (`type: "image"`, base64, `image/png`) when the PNG is at most 1 MiB; it writes into the can and, with `hostPath`,
   under the transfer root (section 12.1, section 13.1).
-- **CLI** (`bin/can.js`): `create (--mount label:/canPath) mounts ls rm exec spawn ps logs kill cp import export cat browse screenshot shell mcp help`. Each
+- **CLI** (`bin/can.js`): `create (--mount label:/canPath) mounts ls rm exec spawn ps logs kill cp import export cat browse screenshot ci tools shell mcp help`. `tools` is section 11.3. Each
   invocation is a new process: it loads only the can it names, and saves after changes. Background processes stop
   when their invocation ends. They live on in `can mcp` and `can shell`. `cp`, `import` and `export` move files in
   either direction (section 13.1).
@@ -527,21 +674,54 @@ waits for it to exit, and deletes the profile (retrying while Windows holds file
 server's exit both kill a browser that is still running. It is not a can, and it is outside the security model of
 sections 10 and 10.4: it is a real browser on the host.
 
+**Chromium setting.** `chromiumBrowserEnabled` (`src/mounts.js`) reads the same mounts file. Chromium is the can's browser
+unless the file sets `"chromiumBrowser": false` (any other value, or no setting, leaves it on). `src/mcp/server.js` creates the
+Chromium browsers only when it is on. The built-in browser is used otherwise.
+
+## 13.3 Lifecycle tools: create, auto-save, status, restart, install [impl]
+
+- **can_create is transactional** (`src/manager.js` `create`, `src/registry.js` `create`). Environment steps run in order
+  (section 14). If a step fails, the can is destroyed and the error is thrown. A save that fails after boot destroys the can and
+  gives EIO with a next step. A failed atomic write removes its `.tmp` and `.lock` files (`manager.js`). The name is reserved
+  only while the call runs (`_reserveName`, released in `finally`), so a failed create frees it.
+- **can_create is idempotent** (`src/registry.js`, `src/mcp/tools.js`). The same name with the same spec and mounts returns the
+  existing can, reported as reused (`can "x" already exists with the same spec; reused`). A live or saved can in a stopped
+  state is pointed to `can_restart`. A different spec gives EEXIST with a next step.
+- **Auto-save.** After each MCP call that changes a can (`can_exec`, `can_spawn`, `can_write_file`, `can_import`, `can_kill`,
+  `can_install` and `browser_screenshot`), the registry saves it (`autosave` in `tools.js`). A failed auto-save does not fail
+  the call, and its error is returned with the result. `can_save` forces an immediate save.
+- **Startup sweep** (`src/registry.js` `sweepStore`). Removes a `.tmp` write file and its `.lock` only when the lock names a dead
+  pid, or when there is no lock and the file is over an hour old. A live pid's files are kept.
+- **can_status** (`statusText` in `tools.js`). Shows the state (`ready`, `crashed`, `stopped`, `memory-limit`, or `saved` on
+  disk, which is described without starting the can), memory from `memoryInfo()` against the 700 MB limit, the tools with
+  their versions and sha256, processes and ports, the sweep count, and the last error with its next step (`registry._errors`).
+- **can_restart** (`CanRegistry.restart`). Works for a crashed, exited, stopped or memory-limit can, and for a ready can, which is
+  saved first. It loads the can from its last save. Processes and ports do not come back, and the result says so.
+- **can_install** (`tools.js`). Runs `pip install` or `npm install` in the can through `exec` with the packages quoted, up to the
+  install limit, and returns the exact versions: pip lock lines, or `name@version` with the integrity from `package-lock.json`.
+  It is never refused by policy; the can's network policy decides. A failed install is an EIO with the installer's own message.
+- **can_ci** reports `pipeline: passed` or `pipeline: failed at job "<j>", step "<s>"` on its first line (section 14.1).
+- **can_destroy** says in its description that it cannot be undone and that it works in any state.
+
 ## 14. Environment specs and network policy (`src/environment.js`, `src/vm/policy.js`) [impl]
 
 An agent can set a can up before it boots: `can_create` takes an `environment` object, and the CLI takes
 `can create --spec file.json`. The spec is checked in full first (`normalizeEnvironment`, which touches nothing on
 the host), so a bad value costs nothing. Then `CanManager.create` boots the can and applies the steps in this order:
 
-1. `requireTools`: each named command must answer `which` in the can. Native toolchains (cargo) are not there, so a
+1. `tools`: each `name: version` is resolved with `resolveTool` (section 11.3). It never downloads: a copy that is not
+   present fails with the next step `can tools fetch <name>`. The resolved tools (name, version, sha256) are kept on the can.
+2. `requireTools`: each named command must answer `which` in the can. Native toolchains (cargo) are not there, so a
    spec that needs them fails here with the reason.
-2. `workdir`: created; setup commands run in it, and it becomes the folder that `exec` and `spawn` start in when they are
+3. `workdir`: created; setup commands run in it, and it becomes the folder that `exec` and `spawn` start in when they are
    not given a `cwd` (`Can.setCwd`, saved with the can).
-3. `imports`: host files or folders copied in with `importToCan`. `exclude` names entries to leave out at any depth
+4. `imports`: host files or folders copied in with `importToCan`. `exclude` names entries to leave out at any depth
    (`node_modules`, `.git`, `*.log`; `*` matches inside one name, and a name with "/" is refused). Symbolic links to
    folders are still refused, as in section 13.1, so exclude a folder whose links would not resolve.
-4. `files`: written inline (utf8 or base64), replacing existing files unless `overwrite` is false.
-5. `setup`: commands run in order in the workdir, each with its own `timeoutMs` (default 300 s, at most 600 s). A failing
+5. `files`: written inline (utf8 or base64), replacing existing files unless `overwrite` is false.
+6. `pip`: lock lines (`environment.pip`) installed with the can's pip (section 11.2), checked against their hashes. A failure is EIO
+   with the line and the output.
+7. `setup`: commands run in order in the workdir, each with its own `timeoutMs` (default 300 s, at most 600 s). A failing
    step (unless `optional`) stops the sequence.
 
 Any failure destroys the can before it is returned, and the error carries the step's output, so no agent is left with a

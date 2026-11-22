@@ -6,3 +6,6 @@ Thumbs.db
 
 # Build output
 dist/
+
+# Tools bundled into installers and built with can tools fetch (see toolchains.lock.json)
+/toolchains/

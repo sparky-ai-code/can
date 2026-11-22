@@ -1,6 +1,6 @@
 # Can runtime design
 
-Status: draft for review. Nothing here is implemented.
+Status: implemented on branch claude/app-boot-infrastructure-c4e589 (2026-11-22); see SPEC.md for the as-built details.
 Date: 2026-11-22.
 Base: worktree `claude/app-boot-infrastructure-c4e589`, including its uncommitted Express 5 fixes.
 Scope: the runtime tier, how tools get into a can, the 500 MB memory ceiling, reliability, and the MCP surface. Minecraft is out of scope.
@@ -439,67 +439,51 @@ Run commands with can_exec.
 
 The following tools are unchanged: can_list, can_mounts, can_spawn, can_logs, can_kill, can_read_file, can_write_file, can_import, can_export, can_list_dir, can_http, can_record_start, can_record_stop; browser_goto, browser_snapshot, browser_click, browser_type, browser_select, browser_submit, browser_text, browser_query, browser_back, browser_evaluate, browser_console, browser_screenshot; computer_screenshot, computer_action; and host_browser_goto, host_browser_text, host_browser_evaluate, host_browser_screenshot, host_browser_close.
 
-## 7. Open decisions for the owner
+## 7. Decisions taken
 
-1. Should Rust code compile inside a can, or only run prebuilt wasm32-wasip1 programs?
-   - Options: accept no compile; track rustc on WASI; a later microVM tier.
-   - Default: accept no compile for now.
-   - Blocks: any Rust build step.
-2. Should CPython ship inside the installer (+15.5 MB), or download on first use?
-   - Options: bundle it; download and cache on first use.
-   - Default: bundle it, so the first run needs no network.
-   - Blocks: installer size and the first-run path.
-3. Should toolchain files be mirrored on a project-controlled host, or fetched from GitHub?
-   - Options: project mirror; GitHub release URLs.
-   - Default: mirror. The CPython builds come from an unofficial repo with no checksum files (3.1).
-   - Blocks: the URLs in `toolchains.lock.json`.
-4. Should Windows get a small native helper that sets a Job Object memory limit?
-   - Options: helper for a true hard cap; watchdog sampling only.
-   - Default: helper. The child_process docs document no job-limit option (UNVERIFIED that none exists), and nesting a second job is UNVERIFIED.
-   - Blocks: the hard cap on Windows.
-5. Should macOS accept a watchdog-only cap, which can overshoot by one sample's allocation?
-   - Options: accept and document it; wait for a native helper.
-   - Default: accept and document it for the first release, since no usable macOS OS hard cap is documented (UNVERIFIED).
-   - Blocks: the macOS memory claim.
-6. Should Chromium processes count toward a can's 500 MB budget?
-   - Options: count them; report them separately.
-   - Default: report separately. They run outside the can's child process.
-   - Blocks: the meaning of "memory used" in `can_status`.
-7. Should `can_ps` and `can_ports` be removed now, or kept as aliases for one release?
-   - Options: remove now; keep aliases for one release.
-   - Default: keep aliases for one release, so existing clients do not break at once.
-   - Blocks: the tool list in 6.5.
-8. Should every mutating call auto-save, so `can_save` is no longer needed?
-   - Options: keep `can_save` only; auto-save after each mutating call, keeping `can_save` to force an immediate save.
-   - Default: auto-save. Restart-from-save (6.4) and crash recovery only keep what was saved. Without auto-save, a crash loses every change since the last `can_save`, which breaks "set up once and it works".
-   - Blocks: the `can_save` description and how much a crash loses.
-9. Should the WASI shim be vendored from browser_wasi_shim 0.4.2, or written in-house?
-   - Options: vendor and pin; write our own.
-   - Default: vendor and pin (MIT OR Apache-2.0, no runtime dependencies). Whether it runs CPython is UNVERIFIED.
-   - Blocks: the WASI tier.
-10. Should Python stay on the 3.15.2 pin, or move to WASI 0.3 when it is available?
-   - Options: stay on 3.15.2; move to 3.16 and wasip3.
-   - Default: stay on 3.15.2. wasip3 builds are components, which the preview1 shim does not implement (inference).
-   - Blocks: the Python pin and update policy.
-11. Are the memory defaults right: V8 256 MB, wasm 160 MiB, soft limit 450 MB, hard limit 500 MB?
-   - Options: keep these values; change them after the test.
-   - Default: keep them until the wasm maximum test runs.
-   - Blocks: the numbers in `can_status` and the error text.
-12. Who will make the README `chromiumBrowser` fixes, since they are outside this task's files?
-   - Options: a separate small change now; fold into the release.
-   - Default: a separate change now. README.md:101-102 and 293 say `chromiumBrowser` must be set to true, but Chromium is on by default and `false` opts out (src/mounts.js:50-55, src/mcp/server.js:263-264).
-   - Blocks: the accuracy of the docs.
-13. Should restarting a crashed or memory-stopped can use can_create with the same name and spec, or a dedicated restart tool?
-   - Options: reuse can_create (no new tool, fewer tools); add a can_restart tool.
-   - Default: reuse can_create. It keeps the tool count minimal (6.1), and the recovery path in 5.6 already goes through it.
-   - Blocks: the can_create description, can_status next-step text, and the skill's Errors section.
-14. How should the parent read a child's OS memory metric every 250 ms without native code, or should the native helper (question 4) also report memory?
-   - Options: spawn a system tool (for example `ps` or PowerShell) for each sample; use the native helper (question 4) for the metric.
-   - Default: none yet. Measure the cost of each option first.
-   - Blocks: the watchdog in 4.3(c).
-15. Should a can refuse interactive pip and npm installs that are not in a hash lock?
-   - Options: allow with registry hash (default, so agents can explore); refuse unless locked (strict).
-   - Blocks: the pip and npm commands.
+The owner decided the following on 2026-11-22. They override the defaults proposed in the first draft, and the
+implementation follows them. Decision N answers question N of the first draft, so the "question N" references in
+sections 2 to 6 point to the decision with the same number.
+
+1. Never compile Rust in a can. Prebuilt `wasm32-wasip1` `.wasm` programs run.
+2. CPython 3.15.2 for wasm32-wasip1 is bundled with the app.
+3. Tool downloads are opt-in, through `can tools` commands only. The runtime never downloads a tool on its own. The
+   source is GitHub by default, or a mirror that the user sets.
+4. A small native Windows helper puts each can process in a Job Object with a hard memory limit.
+5. macOS uses a sampling watchdog only.
+6. Chrome and Edge processes do not count toward a can's memory limit.
+7. `can_ps` and `can_ports` stay advertised. `can_status` is added beside them.
+8. Auto-save after every call that changes a can. `can_save` stays and forces an immediate save.
+9. The WASI library is `@bjorn3/browser_wasi_shim` 0.4.2, vendored and integrity-checked.
+10. Python stays pinned to 3.15.x.
+11. One memory limit of 700 MB per can, with no fixed split between JavaScript and wasm. Hard limit 700 MB on the can's
+    child process. Soft limit 630 MB, where new `can_exec` and `can_spawn` calls are refused with ENOMEM. V8 old space
+    600 MB. Wasm memories capped at 700 MB as a backstop.
+12. The README's `chromiumBrowser` wording is fixed: Chromium is on by default, and `"chromiumBrowser": false` opts out.
+13. A `can_restart` tool restarts a crashed, stopped or memory-stopped can from its last save.
+14. Memory is read per platform. Windows: the helper's private bytes. macOS: `ps -o rss=` every second, plus the child's
+    `process.memoryUsage().rss` over IPC every 250 ms. Linux: `/proc/<pid>/status` VmRSS. The parent compares the larger
+    of the two values.
+15. Interactive installs are never refused. A `can_install` tool lets agents install packages and get exact lock lines back.
+
+### Differences from this design
+
+The as-built system differs from this draft in these ways. SPEC.md has the details.
+
+- **Memory ceiling is 700 MB per can, not 500 MB** (decision 11). The soft limit is 630 MB and the V8 old space is 600 MB.
+  Section 4 was written for 500 MB, and its numbers do not apply.
+- **`can_ps` and `can_ports` are kept**, not removed (decision 7). Section 6.5 does not apply.
+- **A `can_restart` tool was added** (decision 13). Reusing `can_create` alone was the draft's default.
+- **`can_install` was added** (decision 15).
+- **WebAssembly runs in a worker thread with a VFS proxy.** The worker asks the can process for each file call, so a
+  program that never returns can be terminated (`src/runtime/wasi/run.js`, `src/runtime/wasi/wasm-worker.js`).
+- **A stuck watchdog was added.** A can with requests pending that gets no message from its child for more than 10 s, or
+  longer than its own timeout plus 5 s, is stopped with ETIMEDOUT and status `crashed` (`src/vm/supervisor.js`). The
+  draft did not cover busy loops.
+- **`--allow-worker` is set**, which the draft did not plan. A worker that escaped code starts runs outside the layer-2
+  membrane. Layer-1 permissions were tested as still denying file reads and child processes inside a worker on Node 24
+  (`test/vm.test.js`). Node 20 is untested.
+- **Chrome and Edge do not count** toward the memory limit (decision 6). The draft defaulted to reporting them separately.
 
 ## 8. Sources
 

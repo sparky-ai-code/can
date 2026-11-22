@@ -28,7 +28,7 @@ const INSTRUCTIONS = [
   'Cans are virtual Linux-like machines for running code safely. Each can has its own files, processes,',
   'network ports and headless browser, and cannot touch the host.',
   'Typical flow: can_create, then can_write_file and can_exec. For a server, can_spawn, then can_ports,',
-  'then can_http or browser_goto http://localhost:<port>/. Call can_save to keep state across restarts.',
+  'then can_http or browser_goto http://localhost:<port>/. Cans are saved after every change (can_save forces a save). Call can_status to see a can\'s state, memory and tools; if a can crashed or hit its memory limit, call can_restart.',
   'Browser tools return page snapshots with refs such as [e3]; pass refs as targets.',
   'To keep a record of a QA run, call can_record_start before testing and can_record_stop after: it writes a video of',
   'the browser and a timeline of the calls.',
