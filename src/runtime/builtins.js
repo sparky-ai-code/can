@@ -379,6 +379,7 @@ function* node(args, io, sh) {
   const rt = startJsFile({
     can: sh.can, pid: sh.pid, file, args: runArgs, cwd: sh.cwd, env: { ...sh.env },
     stdout: io.stdout, stderr: io.stderr, stdin: asReadable(io.stdin), signal: sh.signal, sources, preload,
+    deferFinish: !sh.syncDriver,
   });
   if (rt.finished) return rt.resultCode ?? 0;
   try {

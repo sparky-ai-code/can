@@ -575,17 +575,25 @@ scripts with `#!/usr/bin/env node` load. Line numbers are unchanged.
 layer-2 flag `--disallow-code-generation-from-strings` stays on. Express loads without them (its `depd` dependency only
 generates code when `deprecate.function` is called), so the load-time failure is gone, but see "Express" below.
 
-**Express (not yet working).** `require('express')` loads, and `app.listen` starts. A request to the app then crashes the
-can VM. Two membrane limits sit behind it, and both are open:
-- Express replaces the prototype of each request and response object (`Object.setPrototypeOf`). The membrane now lets
-  sandbox code do that for host objects: the proxy target takes the new prototype, and a sandbox prototype's members win
-  over the host object's. A host prototype is still refused (`test/membrane-hosts.test.js`).
-- Stream classes from `stream` cannot be subclassed the ES5 way (`Transform.call(this, options)` in a function that sets
-  its own fields first). The host constructor checks `this instanceof Transform`, which fails because the sandbox
-  prototype chain holds a membrane proxy, not the host prototype. The state is never set, and the first use throws
-  (`_readableState` / `kState` undefined). iconv-lite's decode stream is one such subclass, and it is where the request
-  crashes. Fixing this needs either a sandbox-realm stream implementation or a policy decision to expose host prototypes
-  to the sandbox, which would weaken layer 2. Not decided here.
+**Express 5 works.** `require('express')` loads, a request is answered, and JSON and form bodies are parsed, so an Express
+app that listens on a port boots and serves requests (`test/boot-frameworks.test.js`, live run with `CAN_LIVE_TESTS=1`). Four
+faults stood in the way, and each is fixed where it lives:
+- **Streams run in the can's realm.** `require('stream')` is `src/runtime/sandbox/stream.js`, a stream library written in
+  JavaScript and run inside the can (`JsRuntime.loadInternal`). A host stream class cannot be subclassed the ES5 way
+  (`Transform.call(this)` leaves the state on the sandbox object, which the host never sees), and iconv-lite does exactly that.
+  `test/stream.test.js` covers it. `stream/promises` is the promise form of the same module.
+- **Membrane getters on a replaced prototype.** After Express sets a request's prototype, a host getter such as `readable` ran
+  with the proxy as receiver and answered wrongly. It now runs on the host object, and its result is still wrapped
+  (`src/vm/membrane.js`, `ownerOf`).
+- **The request looks like a live request.** The request's socket is an EventEmitter that is readable and writable, and the body
+  is pushed on the readable side (not ended on the writable side), because on-finished checks those. `vnet.request` sets
+  `Content-Length` for a body, as a real client does (`src/runtime/http.js`, `src/kernel/vnet.js`).
+- **Promise work finishes.** A program ends once nothing keeps it alive, but that check now runs on a later macrotask, so
+  promise continuations that are already queued run first (`JsRuntime.checkAlive`, `src/runtime/js.js`).
+
+Native code is still out of reach: a Node addon, a program in another language, or a JVM. Running those needs a backend
+that starts real processes, which the sandbox rule in section 1 forbids for a can today. That is a decision for the owner,
+not something this section changes.
 
 **Host callbacks and process.exit.** `process.exit()` inside a callback that host code runs (a response's `end` event, a
 socket event) used to take the whole can VM down: the unwinding error reached host code as an uncaught exception. The

@@ -439,9 +439,8 @@ These are stated plainly, from `SPEC.md` section 10.4:
   `await` and destructured exports) and built-in shell. The shell has `$(...)`, `if`, loops, functions and heredocs.
   Not supported: `case`, `${VAR#pat}` trimming, arrays and `[[ ]]`. `npm run` and `npm test` read the can's
   `package.json`. `npm install` works against the registry (see Environment), but install scripts and native addons do
-  not run, and packages that generate code from strings fail to load. Express loads, but a request to an Express app
-  still crashes the can: its request path uses iconv-lite's stream classes, which a can cannot subclass yet (SPEC.md
-  section 14, "Express"). Plain `http` servers work. `printf`, `echo -e` and `node -p` work. To write a file with its
+  not run, and packages that generate code from strings fail to load. Express 5 works: an app listens, parses JSON and
+  form bodies, and answers requests (SPEC.md section 14). Plain `http` servers work. `printf`, `echo -e` and `node -p` work. To write a file with its
   content, use `can_write_file`.
 - **Not Chromium, but it boots like one.** Pages get the browser APIs they probe at start-up (matchMedia, observers,
   layout queries, DOM classes, a 2D canvas context, and stubs for WebSocket, Worker, IndexedDB and geolocation) and a page's

@@ -9,7 +9,6 @@ import {
 } from 'node:util';
 import { Buffer } from 'node:buffer';
 import * as nodeUrl from 'node:url';
-import nodeStream from 'node:stream';
 import nodeCrypto from 'node:crypto';
 import nodeQuerystring from 'node:querystring';
 import { StringDecoder } from 'node:string_decoder';
@@ -368,7 +367,9 @@ const FACTORIES = {
   process: (rt) => rt.process,
   child_process: (rt) => makeChildProcess(rt),
   crypto: () => nodeCrypto,
-  stream: () => nodeStream,
+  // Streams run in the can's realm, so programs can subclass them (see src/runtime/sandbox/stream.js).
+  stream: (rt) => rt.loadInternal('stream'),
+  'stream/promises': (rt) => rt.loadInternal('stream/promises'),
   querystring: () => nodeQuerystring,
   string_decoder: () => ({ StringDecoder }),
   assert: () => nodeAssert,

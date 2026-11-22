@@ -1087,5 +1087,7 @@ export function runShellText(src, sh, io, opts = {}) {
 
 /** Synchronous variant for child_process.execSync and friends. */
 export function runShellSync(src, sh, io) {
+  // A nested program started from here cannot be waited for (no event loop), so it must report its end at once.
+  sh.syncDriver = true;
   return driveSync(runTop(src, sh, io, {}));
 }

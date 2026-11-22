@@ -28,6 +28,14 @@ const INTRINSIC_NAMES = [
   'Uint32Array', 'Int32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array',
 ];
 
+/** The object in `obj`'s prototype chain that owns `key` (obj itself, or a prototype), or undefined. */
+function ownerOf(obj, key) {
+  for (let o = obj; o; o = Reflect.getPrototypeOf(o)) {
+    if (Object.prototype.hasOwnProperty.call(o, key)) return o;
+  }
+  return undefined;
+}
+
 export class Membrane {
   /** @param {object} context the contextified object of the vm context this membrane serves */
   constructor(context) {
@@ -145,6 +153,11 @@ export class Membrane {
     traps.get = (t, key, receiver) => {
       // The host object's own properties keep precedence over the sandbox prototype's members.
       if (reproto.has(t) && !BLOCKED_KEYS.has(key) && !Object.hasOwn(raw, key) && key in t) {
+        // A getter that a host prototype defines (Readable's `readable`, say) reads host state. It must run on the
+        // host object: with the proxy as receiver it sees no state and answers wrongly. Its result is still wrapped.
+        const owner = ownerOf(t, key);
+        const desc = owner && this.proxyRaw.has(owner) ? Reflect.getOwnPropertyDescriptor(owner, key) : undefined;
+        if (desc && desc.get) return desc.get.call(raw);
         return Reflect.get(t, key, receiver);
       }
       return baseGet(t, key, receiver);

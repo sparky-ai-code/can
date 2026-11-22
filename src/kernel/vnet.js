@@ -111,12 +111,16 @@ export class VNet {
       throw new KernelError('ECONNREFUSED', `ECONNREFUSED: connection refused :${port}`, { port });
     }
     const reqHeaders = lowerKeys(headers);
+    const reqBody = encodeBody(body, reqHeaders);
+    // An HTTP/1.1 request with a body says how long it is. Without Content-Length a server (Express, body-parser,
+    // any framework that checks the header) treats the request as having no body, as node does.
+    if (reqBody.length > 0 && !('content-length' in reqHeaders)) reqHeaders['content-length'] = String(reqBody.length);
     const req = {
       port: listener.port,
       method: String(method).toUpperCase(),
       url: path,
       headers: reqHeaders,
-      body: encodeBody(body, reqHeaders),
+      body: reqBody,
     };
     const outcome = await raceTimeout(
       new Promise((resolve) => resolve(listener.handler(req))).then(
