@@ -29,7 +29,7 @@ The installers are not code-signed yet, so the system warns on first run. On Win
 
 To uninstall, use **Settings > Apps > Can** on Windows. On macOS run `sudo sh /usr/local/lib/can/uninstall.sh`. Saved cans in `~/.can` are kept either way.
 
-To check or repair the agent setup, run `node <install folder>\app\scripts\agent-setup.js status`, or `... install` to set it up again. The Windows install folder is `%LOCALAPPDATA%\Programs\Can`; on macOS it is `/usr/local/lib/can`, with the bundled Node at `node/bin/node`.
+To check or repair the agent setup, run `node <install folder>\app\scripts\agent-setup.js status`, or `... install` to set it up again. The Windows install folder is `%LOCALAPPDATA%\Programs\Can`; on macOS it is `/usr/local/lib/can`, with the bundled Node at `node/node`.
 
 ## Quick start
 

@@ -18,7 +18,7 @@ mkdir -p "$payload/usr/local/lib/can" "$payload/usr/local/bin"
 cp -R "$stage/node" "$stage/app" "$payload/usr/local/lib/can/"
 cp "$here/uninstall.sh" "$payload/usr/local/lib/can/uninstall.sh"
 cp "$stage/shims/can" "$stage/shims/can-mcp" "$payload/usr/local/bin/"
-chmod 755 "$payload/usr/local/lib/can/node/bin/node" "$payload/usr/local/lib/can/uninstall.sh" \
+chmod 755 "$payload/usr/local/lib/can/node/node" "$payload/usr/local/lib/can/uninstall.sh" \
   "$payload/usr/local/bin/can" "$payload/usr/local/bin/can-mcp"
 find "$payload" -type d -exec chmod 755 {} +
 

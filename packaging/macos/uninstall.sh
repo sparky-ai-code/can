@@ -9,7 +9,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-NODE=/usr/local/lib/can/node/bin/node
+NODE=/usr/local/lib/can/node/node
 SETUP=/usr/local/lib/can/app/scripts/agent-setup.js
 
 user=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)

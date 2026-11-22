@@ -143,7 +143,7 @@ jobs:
           set -euo pipefail
           echo "console user: $(/usr/bin/stat -f%Su /dev/console)"
           sudo installer -pkg "$INSTALLER" -target /
-          test -x /usr/local/lib/can/node/bin/node
+          test -x /usr/local/lib/can/node/node
           test -x /usr/local/bin/can
           test -x /usr/local/bin/can-mcp
 
@@ -153,7 +153,7 @@ jobs:
           node packaging/smoke-test.mjs \
             --can /usr/local/bin/can \
             --can-mcp /usr/local/bin/can-mcp \
-            --node /usr/local/lib/can/node/bin/node \
+            --node /usr/local/lib/can/node/node \
             --setup /usr/local/lib/can/app/scripts/agent-setup.js
 
       - name: Uninstall and check the cleanup

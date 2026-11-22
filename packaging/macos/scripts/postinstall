@@ -2,7 +2,7 @@
 # Runs as root after the package is installed. Sets up the agent skill and the MCP registration for the
 # account that is logged in at the console, using the bundled node. Never fails the install: a problem is
 # printed and the user can run the setup again by hand (see README.md).
-NODE=/usr/local/lib/can/node/bin/node
+NODE=/usr/local/lib/can/node/node
 SETUP=/usr/local/lib/can/app/scripts/agent-setup.js
 
 user=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)

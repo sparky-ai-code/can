@@ -44,7 +44,7 @@ function cmdShim(script) {
 
 /** macOS shell shim: runs the bundled node on the app's CLI. */
 function shShim(script) {
-  return `#!/bin/sh\nexec "${INSTALL_ROOT_MAC}/node/bin/node" "${INSTALL_ROOT_MAC}/app/bin/${script}" "$@"\n`;
+  return `#!/bin/sh\nexec "${INSTALL_ROOT_MAC}/node/node" "${INSTALL_ROOT_MAC}/app/bin/${script}" "$@"\n`;
 }
 
 function copyApp(out) {
