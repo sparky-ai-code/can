@@ -2,6 +2,7 @@
 // Nothing here touches host files, processes or ports. Built-in modules come from modules.js and are
 // backed by the can (VFS, vnet, process table). Host-side I/O for outbound http(s) is in modules.js.
 import vm from 'node:vm';
+import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { format } from 'node:util';
 import { posix } from 'node:path';
@@ -14,6 +15,12 @@ import { loadBuiltin, ALLOWED_BUILTINS, ASYNC_BUILTINS, builtinReady } from './m
 import { needsEsm, toCommonJs, staticSpecs, withDynamicImport } from './esm.js';
 import { Membrane, hardening } from '../vm/membrane.js';
 import { installStackFilter, hostFreeStack } from '../vm/stacks.js';
+
+/** Built-ins written in JavaScript that run inside the can's realm (JsRuntime.loadInternal). */
+const INTERNAL_BUILTINS = {
+  stream: new URL('./sandbox/stream.js', import.meta.url),
+  'stream/promises': new URL('./sandbox/stream-promises.js', import.meta.url),
+};
 
 /** The version the can reports as process.version: the policy's nodeVersion, else the runtime default. */
 export function nodeVersionOf(can) {
@@ -188,8 +195,12 @@ export class JsRuntime {
    * @param {import('node:stream').Readable} [opts.stdin]
    * @param {Map<string,string>} [opts.sources] in-memory source overrides keyed by absolute path (node -e)
    */
-  constructor({ can, pid, cwd, env, args = [], stdout, stderr, stdin, sources = new Map(), preload = [] }) {
+  constructor({ can, pid, cwd, env, args = [], stdout, stderr, stdin, sources = new Map(), preload = [], deferFinish = true }) {
     this.sources = sources;
+    // A program run from a synchronous caller (execSync) must have ended when start() returns; see checkAlive.
+    this.deferFinish = deferFinish;
+    // Built-ins written in JavaScript that run in this can's realm (see loadInternal). Never visible to the VFS.
+    this.internal = new Map();
     this.preload = preload; // absolute paths run as CommonJS before the main file (node --require)
     this.can = can;
     this.vfs = can.vfs;
@@ -245,8 +256,22 @@ export class JsRuntime {
     return this.timers.size > 0 || this.ports.size > 0 || this.pending > 0;
   }
 
+  /**
+   * Ends the program once nothing keeps it alive. The check runs on a later macrotask, not at once: promise
+   * continuations that are already queued (an `await` that resolves at once, a stream pump) must run first, as
+   * they do in node, or a program that only awaits would end in the middle of its own work.
+   */
   checkAlive() {
-    if (!this.finished && this.mainDone && !this.isAlive()) this.finish(this.exitCodeValue ?? 0);
+    if (this.finished || !this.mainDone || this.aliveCheckQueued) return;
+    if (!this.deferFinish) {
+      if (!this.isAlive()) this.finish(this.exitCodeValue ?? 0);
+      return;
+    }
+    this.aliveCheckQueued = true;
+    setImmediate(() => {
+      this.aliveCheckQueued = false;
+      if (!this.finished && this.mainDone && !this.isAlive()) this.finish(this.exitCodeValue ?? 0);
+    });
   }
 
   /** Ends the program: clears timers, closes its ports, emits 'exit' and resolves `done`. */
@@ -346,7 +371,7 @@ export class JsRuntime {
     const module = { id: abs, filename: abs, exports: {}, loaded: false, parent, async: false };
     this.cache.set(abs, module);
     try {
-      const raw = this.sources.get(abs) ?? this.vfs.readFile(abs, 'utf8');
+      const raw = this.internal.get(abs) ?? this.sources.get(abs) ?? this.vfs.readFile(abs, 'utf8');
       const src = raw.replace(/^﻿/, '');
       if (abs.endsWith('.json')) {
         module.exports = vm.runInContext('JSON.parse', this.context)(src);
@@ -464,6 +489,19 @@ export class JsRuntime {
   builtin(name) {
     if (!this.builtinCache.has(name)) this.builtinCache.set(name, loadBuiltin(this, name));
     return this.builtinCache.get(name);
+  }
+
+  /**
+   * Loads a built-in that is written in JavaScript and runs in this can's realm, so that programs can subclass
+   * its classes the ES5 way (a host class cannot be: see src/runtime/sandbox/stream.js). The source is read from
+   * the can runtime's own folder; nothing is written to the can's files.
+   */
+  loadInternal(name) {
+    const file = INTERNAL_BUILTINS[name];
+    if (!file) throw new Error(`no internal built-in named ${name}`);
+    const abs = `/__can_internal__/${name.replace('/', '-')}.js`;
+    if (!this.internal.has(abs)) this.internal.set(abs, readFileSync(file, 'utf8'));
+    return this.loadModule(abs, null, true);
   }
 
   /** Resolves a relative/absolute path or a node_modules package to an absolute VFS file. */

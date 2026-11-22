@@ -260,7 +260,27 @@ export async function runCi(registry, rawSpec, { transferRoot, canName } = {}) {
   return report;
 }
 
-/** The text an agent or a terminal reads: one line per job, one per step, and the output of each failing step. */
+/**
+ * The first line of a CI report (interface I6): `pipeline: passed`, or `pipeline: failed at job "<j>", step "<s>"`.
+ * A setup failure is `pipeline: failed at setup`.
+ */
+export function pipelineLine(report) {
+  if (report.setupFailed) return 'pipeline: failed at setup';
+  if (report.ok) return 'pipeline: passed';
+  const job = report.jobs.find((j) => j.status === 'failed' && !j.allowFailure);
+  if (job) {
+    const step = job.steps.find((s) => s.status === 'failed');
+    return `pipeline: failed at job "${job.name}", step "${step?.label ?? '?'}"`;
+  }
+  const artifact = report.artifacts.find((a) => a.error);
+  if (artifact) return `pipeline: failed at artifact "${artifact.canPath}"`;
+  return 'pipeline: failed (the run stopped; see the report below)';
+}
+
+/**
+ * The text a terminal reads: one line per job, one per step, and the output of each failing step. The MCP tool puts
+ * pipelineLine() above it as the first result line (see src/mcp/tools.js).
+ */
 export function describeCi(report) {
   const lines = [];
   const title = report.name ? `"${report.name}"` : 'pipeline';

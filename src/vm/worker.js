@@ -213,3 +213,11 @@ process.on('unhandledRejection', (reason) => {
 });
 
 send({ t: 'ready', pid: process.pid, layer2: LAYER2 });
+
+// Memory report for the host (supervisor.js): this process's resident size every 250 ms. The host compares it with
+// its own reading of the child and keeps the larger one. The timer is unref'd so it never keeps this process alive.
+const MEMORY_REPORT_MS = 250;
+const memoryTimer = setInterval(() => {
+  if (process.connected) send({ t: 'mem', rss: process.memoryUsage().rss });
+}, MEMORY_REPORT_MS);
+memoryTimer.unref();

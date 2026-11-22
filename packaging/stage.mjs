@@ -5,14 +5,19 @@
 //
 // Output (the same on both platforms):
 //   <out>/node/node[.exe]                the Node runtime the app runs on, bundled so users need none
+//   <out>/app/native/win/can-memcap.exe  Windows only: the memory helper (native/win/build.js must run first)
 //   <out>/app/bin, app/src, app/skills   the CLI, the MCP server and the runtime, as in the repository
-//   <out>/app/package.json, app/README.md
+//   <out>/app/package.json, app/README.md, app/toolchains.lock.json
+//   <out>/app/toolchains/<sha256>/      the tools the runtime runs (CPython for wasm32-wasip1), fetched from GitHub
+//                                        with `can tools fetch` and verified against the lock. Pass --toolchains-from <dir>
+//                                        to use an archive folder you already have (for example one from `can tools mirror`).
 //   <out>/app/scripts/agent-setup.js     per-user setup: agent skill and MCP registration
 //   <out>/cmd/can.cmd, can-mcp.cmd       Windows: command shims; the installer adds cmd/ to the user's PATH
 //   <out>/shims/can, can-mcp             macOS: command shims; the .pkg installs them into /usr/local/bin
 // Nothing from test/, docs/, .github/, videos or the working copy's own tooling is copied.
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -30,6 +35,15 @@ function parseArgs(argv) {
   }
   if (!['win32', 'darwin'].includes(opts.platform)) throw new Error(`unsupported --platform ${opts.platform}`);
   return opts;
+}
+
+/** Windows: copies the memory helper to where src/vm/memcap.js looks for it. */
+function copyMemoryHelper(out) {
+  const exe = path.join(repo, 'native', 'win', 'build', 'can-memcap.exe');
+  if (!fs.existsSync(exe)) throw new Error(`ENOENT: ${exe} is missing. Next: run node native/win/build.js first.`);
+  const dir = path.join(out, 'app', 'native', 'win');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.copyFileSync(exe, path.join(dir, 'can-memcap.exe'));
 }
 
 /** Windows batch shim: runs the bundled node on the app's CLI, keeping the exit code. */
@@ -55,9 +69,19 @@ function copyApp(out) {
   }
   fs.mkdirSync(path.join(app, 'scripts'), { recursive: true });
   fs.copyFileSync(path.join(repo, 'packaging', 'agent-setup.js'), path.join(app, 'scripts', 'agent-setup.js'));
-  for (const file of ['package.json', 'README.md']) {
+  for (const file of ['package.json', 'README.md', 'toolchains.lock.json']) {
     fs.copyFileSync(path.join(repo, file), path.join(app, file));
   }
+}
+
+/**
+ * Bundles the tools into <app>/toolchains. The staged CLI does the download, so the installer holds exactly what
+ * `can tools fetch` would put there: the GitHub source, verified by size and sha256 against the lock.
+ */
+function bundleToolchains(out, fromDir) {
+  const args = [path.join(out, 'app', 'bin', 'can.js'), 'tools', 'fetch', '--source', 'github', '--into', path.join(out, 'app', 'toolchains')];
+  if (fromDir) args.push('--from', path.resolve(fromDir));
+  execFileSync(process.execPath, args, { stdio: 'inherit' });
 }
 
 function main() {
@@ -73,8 +97,10 @@ function main() {
   if (opts.platform === 'darwin') fs.chmodSync(nodeTarget, 0o755);
 
   copyApp(out);
+  bundleToolchains(out, opts['toolchains-from']);
 
   if (opts.platform === 'win32') {
+    copyMemoryHelper(out);
     fs.mkdirSync(path.join(out, 'cmd'), { recursive: true });
     fs.writeFileSync(path.join(out, 'cmd', 'can.cmd'), cmdShim('can.js'));
     fs.writeFileSync(path.join(out, 'cmd', 'can-mcp.cmd'), cmdShim('can-mcp.js'));

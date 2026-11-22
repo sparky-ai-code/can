@@ -70,9 +70,12 @@ Each can is named by its name or id. Tool errors come back as results with `isEr
 | --- | --- |
 | `can_create` | Create a saved can (optional name; default `can-N`; optional `mounts`, see Host folders; optional `environment`, see Environment) |
 | `can_mounts` | List the host folders the user has made available to cans, by label (no host paths) |
-| `can_list` | List cans with status `running`, `crashed` or `saved` |
-| `can_destroy` | Stop a can and delete its saved state |
-| `can_save` | Save filesystem and environment to disk |
+| `can_list` | List cans with status `running`, `exited`, `crashed`, `memory-limit` or `saved` |
+| `can_destroy` | Stop a can and delete its saved state. Works in any state, and cannot be undone |
+| `can_save` | Save filesystem and environment to disk now. Cans are also saved after every call that changes them |
+| `can_status` | One can: state, memory against its 700 MB limit, the tools it was created with (name, version, sha256), processes, ports, and the last error with its next step |
+| `can_restart` | Start a crashed, stopped or memory-limited can again from its last save. Processes and ports do not come back, and the result says so |
+| `can_install` | Install packages with the can's pip (pure-Python wheels only) or npm. pip returns exact lock lines (`name==version --hash=sha256:<hex>`) to pin in `environment.pip` |
 | `can_exec` | Run a shell command (60 s limit unless `timeoutMs`); returns exit code, stdout, stderr (capped at about 20 KB) |
 | `can_spawn` | Start a background process (e.g. `node server.js`); returns its pid |
 | `can_ps` | List processes |
@@ -98,8 +101,8 @@ Each can is named by its name or id. Tool errors come back as results with `isEr
 | `browser_evaluate` | Run JavaScript in the page; returns JSON |
 | `browser_console` | Console messages, including script errors |
 | `browser_screenshot` | PNG of the page: written into the can, optionally copied to the transfer root, and returned as an image (see Screenshots) |
-| `computer_screenshot` | PNG of the can's browser viewport, with the pixel coordinates `computer_action` uses. Needs `"chromiumBrowser": true` (see Computer use) |
-| `computer_action` | Pointer and keyboard on that browser at pixel coordinates: move, click (single, double, right, middle), drag, scroll, type, key with modifiers, wait. Returns a new screenshot. Needs `"chromiumBrowser": true` |
+| `computer_screenshot` | PNG of the can's browser viewport, with the pixel coordinates `computer_action` uses. Needs Chromium, which is the default (see Computer use) |
+| `computer_action` | Pointer and keyboard on that browser at pixel coordinates: move, click (single, double, right, middle), drag, scroll, type, key with modifiers, wait. Returns a new screenshot. Needs Chromium, which is the default |
 | `can_record_start` | Start recording a QA session on a can: a timeline of its calls and a video of its browser (see Recording a QA session) |
 | `can_record_stop` | Stop the recording and write `recordings/<name>.mp4` (or `.apng` without ffmpeg) and `recordings/<name>.log.txt` under the transfer root |
 | `host_browser_goto`, `_text`, `_evaluate`, `_screenshot`, `_close` | Opt-in only (see Host folders and the host browser): drive the real Chrome or Edge on this machine |
@@ -131,6 +134,7 @@ can screenshot <can> [--out <name.png>] [--url <url>] [--width N] [--height N] [
                                          PNG of the browser's page, written to the transfer root
 can ci <pipeline.json> [--json]          run a CI pipeline in a fresh can (see CI pipelines); exit 0 passed, 1 failed, 2 bad file
 can shell <can>                          interactive shell: each line runs in the can
+can tools list|fetch|mirror|verify|source   the runtime tools (CPython); downloads only when you run fetch or mirror (see Tools CLI)
 can mcp                                  run the MCP server on stdin/stdout
 can help                                 show this help
 ```
@@ -138,18 +142,48 @@ can help                                 show this help
 Several words after `--` reach the can as separate arguments. `can browse` loads its URL in a fresh VM, so it reaches internet hosts but not a server started in an earlier command. Use `can_http` and `browser_goto` through `can mcp` for local servers. A single word is a whole shell line, for example
 `can exec demo -- "echo hi > /app/a.txt"`.
 
+## Tools CLI
+
+The tools a can runs are listed in `toolchains.lock.json` at the app root. Today that is one entry: CPython 3.15.2 for
+WASI, with its size and sha256. A tool is used only from a copy that is already on the machine: the bundled copy in
+`<app>/toolchains/<sha256>/`, or the cache in `~/.can/toolchains/<sha256>/` (`$CAN_TOOLCHAIN_DIR` changes the cache).
+**Downloads are opt-in.** Nothing else fetches a tool, and `can_create` reports a missing tool with the command to run.
+
+```powershell
+node bin\can.js tools list                                   # each tool, and whether it is bundled or cached
+node bin\can.js tools fetch python                           # download, check, unpack into the cache
+node bin\can.js tools fetch --from D:\mirror                 # use <folder>\<file> when it is there
+node bin\can.js tools mirror D:\mirror                       # download every archive into a folder to host
+node bin\can.js tools verify                                 # re-check each copy against its manifest
+node bin\can.js tools source https://tools.example.com/can   # set the default fetch source
+```
+
+- **Source.** The default is GitHub, the release URL in the lock file. Set a mirror with `tools source <url>`, or pass
+  `--source <url>` to `fetch` or `mirror` for one run. A mirror serves each archive at `<base>/<file>`, with the file name
+  from the lock. `tools source github` goes back to GitHub. The setting is kept in `~/.can/config.json`
+  (`$CAN_CONFIG_FILE` changes the path).
+- **Checks.** A download goes to a temporary file first. Its size and sha256 must match the lock before it is unpacked
+  into the cache, and a failed download leaves no temporary file behind.
+- **Verify.** Each unpacked copy has a manifest of file hashes. `tools verify` reports any copy that no longer matches,
+  with EINTEGRITY. Delete that folder and run `tools fetch` again.
+- The installers fetch CPython once, when they are built, and bundle it (`packaging/stage.mjs`). Nothing fetches it at
+  install time or on first run.
+
 ## Environment: set up a can before it starts
 
 `can_create` takes an `environment` object, and `can create --spec environment.json` does the same from the CLI. The
 spec is checked in full before anything boots. Then these steps run in order. If one fails, the can is discarded and
 the error carries the step's output.
 
-1. `requireTools`: commands that must exist, such as `["npm"]`. A native toolchain such as `cargo` is not there.
-2. `workdir`: a start folder, created if missing. Setup commands run in it.
-3. `imports`: host files or folders copied in, with `exclude` to leave out names such as `node_modules`, `.git` or
+1. `tools`: names and versions from the lock, such as `{"python": "3.15"}`. Each must already be on the machine (see Tools
+   CLI). Nothing is downloaded here.
+2. `requireTools`: commands that must exist, such as `["npm"]`. A native toolchain such as `cargo` is not there.
+3. `workdir`: a start folder, created if missing. Setup commands run in it.
+4. `imports`: host files or folders copied in, with `exclude` to leave out names such as `node_modules`, `.git` or
    `*.log` at any depth.
-4. `files`: text or base64 files written into the can.
-5. `setup`: commands run in order, such as `npm install`, each with a `timeoutMs`. Mark a step `optional` to keep going
+5. `files`: text or base64 files written into the can.
+6. `pip`: lock lines such as `"requests==2.32.3 --hash=sha256:<hex>"`, installed with the can's pip (see Python).
+7. `setup`: commands run in order, such as `npm install`, each with a `timeoutMs`. Mark a step `optional` to keep going
    when it fails.
 
 Other settings: `env` (environment variables), `node` (the Node version the can reports, such as `"24"`), and
@@ -210,6 +244,26 @@ earlier one left behind.
   install scripts or native addons, no workspaces, and no matrix over Node versions (`node` only changes what
   `process.version` reports).
 
+## Python (CPython 3.15.2)
+
+A can runs Python 3.15.2, built for WebAssembly (`wasm32-wasip1`, WASI). The build is bundled with the installers, so
+`python` works in a fresh can without a download. Python runs in a worker thread of the can's own process, and it reads
+and writes the can's files.
+
+- `python script.py args`, `python -c "..."` and `python3` work. A relative script path starts in the can's working
+  folder, as it does in a shell.
+- `pip install <name>...` and `pip install -r requirements.txt` install pure-Python wheels (`py3-none-any` and
+  `py2.py3-none-any`) from PyPI into `/usr/lib/python3.15/site-packages`. Each file is checked against the sha256 that
+  PyPI publishes. `pip list` shows what is installed.
+- **Lock lines.** pip prints one line per installed file: `name==version --hash=sha256:<hex>`. Put those lines in
+  `environment.pip` and every setup installs the same bytes. A hash in the line is checked instead of PyPI's digest.
+- **No compiler.** A can runs no compiler, so sdists and platform wheels are refused with `ENOTSUP`. A package with C
+  extensions does not install. Rust is not compiled in a can either. A prebuilt `wasm32-wasip1` program does run: any
+  command whose path ends in `.wasm` runs with the can's working folder and files.
+- **Memory and limits.** A Python or `.wasm` program has the can's memory limit. One that runs past it exits with code 137
+  and an ENOMEM message. CPython's WASI build has no subprocess or socket support, and `os.symlink` gives `ENOTSUP`.
+- **Version.** `environment.tools` with `"python": "3.15"` selects the bundled copy. The pin stays on 3.15.x.
+
 ## Moving files
 
 Files move between the host and a can through `can_import` and `can_export` (MCP) or `can cp`, `can import` and
@@ -255,8 +309,13 @@ node bin\can.js cp demo:/app/data/a.txt exported\a.txt --overwrite   # replace a
 ### Persistence and lifetime
 
 - Saved state lives in `%USERPROFILE%\.can\cans` (`~/.can/cans` elsewhere). Set `CAN_STORE_DIR` to change it.
-- A can is saved by `can_create`, `can_save`, `can create`, `can exec`, `can spawn`, `can cp`, each shell line, and
-  on a clean shutdown of the MCP server (stdin closed, or Ctrl+C). Processes and open ports are not saved.
+- A can is saved after every MCP call that changes it (`can_exec`, `can_spawn`, `can_write_file`, `can_import`,
+  `can_kill`, `can_install` and `browser_screenshot`), by `can_create` and `can_save` (which forces an immediate save),
+  by `can create`, `can exec`, `can spawn`, `can cp`, each shell line, and on a clean shutdown of the MCP server (stdin
+  closed, or Ctrl+C). Processes and open ports are not saved.
+- `can_create` is all or nothing. If any setup step fails, the can is destroyed and the name is free again, with no
+  files left behind. Calling it again with the same name and the same spec returns the existing can (reused) instead
+  of an error; a different spec gives EEXIST with a next step.
 - Each CLI command is a new process. It loads only the can it names, and that can's VM stops when the command ends.
 - **Background processes live only while a long-running host is alive**: `can mcp` or `can shell`. A
   `can spawn` from the CLI stops when the command exits. Use the MCP server for servers.
@@ -288,14 +347,17 @@ installed on this machine (set `CAN_HOST_BROWSER` to the program if it is elsewh
 Protocol, with a fresh temporary profile. This browser is not sandboxed. It uses the host network and can reach
 services on localhost, and it opens only http and https pages. Screenshots go under the transfer root.
 
-## Real Chromium for cans (opt-in)
+## Real Chromium for cans (on by default)
 
-By default a can's browser is Can's own headless virtual DOM (see Limits). Set `"chromiumBrowser": true` in the same
-mounts file and the MCP browser tools drive a real Chrome or Edge instead, one browser per can, started on first use:
+A can's browser is a real Chrome or Edge, one browser per can, started on first use. The MCP browser tools drive it.
+To use Can's own headless virtual DOM instead (see Limits), set `"chromiumBrowser": false` in the mounts file
+(`%USERPROFILE%\.can\mounts.json`, or `$CAN_MOUNTS_FILE`):
 
 ```json
-{ "chromiumBrowser": true }
+{ "chromiumBrowser": false }
 ```
+
+Only an explicit `false` turns it off; any other value, or no setting, leaves Chromium on (`src/mounts.js`).
 
 - **The can's servers are reachable.** The browser sends every request through a proxy on this machine (loopback
   only, `src/canproxy.js`). `http://localhost:<port>/` goes into the can's own network, so a server the can started
@@ -308,7 +370,7 @@ mounts file and the MCP browser tools drive a real Chrome or Edge instead, one b
   `browser_submit`, `browser_text`, `browser_query`, `browser_back`, `browser_evaluate`, `browser_console` and
   `browser_screenshot`. The screenshot is Chromium's own PNG.
 - **Not yet:** links, cookies, tabs and waits (they fail with `ENOTSUP`), WebSockets to the can, and the CLI
-  commands `can browse` and `can screenshot`, which still use the built-in browser. A can with internet access can
+  commands `can browse` and `can screenshot` use the same browser setting. A can with internet access can
   reach any public host, as before.
 - **Trust:** the proxy listens on loopback with no password, so another program on this machine that knows the port
   could use it to reach the can's servers. Only enable this on a machine you trust.
@@ -319,14 +381,14 @@ sites change.
 
 ## Computer use (real Chrome)
 
-With `"chromiumBrowser": true` (see above), an agent can use the can's browser the way a person does:
+With Chromium on (the default, see above), an agent can use the can's browser the way a person does:
 `computer_screenshot` returns the viewport with its pixel coordinates, and `computer_action` moves the pointer,
 clicks (single, double, right, middle), drags, scrolls, types, presses keys with modifiers, or waits. Every action
 returns a new screenshot. Input goes through the Chrome DevTools protocol (`Input.dispatchMouseEvent` and
 `Input.dispatchKeyEvent`), so pages receive real mouse and keyboard events. Coordinates are checked against the
 viewport and refused with `EINVAL` before anything is sent. Actions also appear in a running recording.
 
-The built-in browser has no pointer or keyboard: its computer tools fail with `ENOTSUP` and say how to turn Chrome on.
+The built-in browser (used when `"chromiumBrowser": false`) has no pointer or keyboard: its computer tools fail with `ENOTSUP` and say how to turn Chromium back on.
 Scope: this is the can's browser. It does not reach the host desktop, and no other application runs in the can.
 Tests: `test/computer.test.js` (skipped when no Chrome or Edge is installed).
 
@@ -397,8 +459,10 @@ says, link and control colours appear, hidden content is absent, and the PNG dec
 Can is designed so that code inside a can cannot touch the host. Two layers enforce this.
 
 1. **Separate process with Node's Permission Model (the real boundary).** Each can is a child process started with
-   `--permission` and `--allow-fs-read` limited to Can's own `src` directory. Writes, child processes, workers,
-   addons and the inspector are denied. The child's environment is empty, except `SYSTEMROOT` on Windows, which DNS needs (SPEC.md section 10.1a). Its V8 heap is capped at 512 MB.
+   `--permission` and `--allow-fs-read` limited to Can's own `src` directory, plus the toolchain folders and the tool
+   lock file (read only). Writes, child processes, addons and the inspector are denied. Worker threads are allowed,
+   for WebAssembly programs (see residual risk 8). The child's environment is empty, except `SYSTEMROOT` on Windows,
+   which DNS needs (SPEC.md section 10.1a). Its V8 old space is capped at 600 MB, and the whole can at 700 MB (see Limits).
 2. **In-process hardening (defence in depth).** A membrane wraps every host value that enters can code. Code
    generation from strings is disabled. Escape hatches such as `process.binding` are removed at boot. Listening on
    a host port (`net`, `http`, `https`, `dgram`) throws `EPERM`, and the refusal cannot be overwritten. Error stacks
@@ -428,20 +492,38 @@ These are stated plainly, from `SPEC.md` section 10.4:
    code runs in that window.
 5. **Verified on Node 24.15.0 only.** `package.json` still declares `engines: >=20`. The permission flags were not
    tested on other versions.
-6. **Memory is capped, CPU is not.** A can past its 512 MB heap cap crashes alone. A synchronous infinite loop still
-   blocks that can's VM, and destroying the can kills it. Foreground commands time out after 60 s by default.
+6. **Memory is capped, CPU is not.** A can past its 700 MB limit is stopped alone, and one past its 600 MB JavaScript heap cap crashes alone. A synchronous infinite loop still
+   blocks that can's VM until the stuck watchdog stops the can (see Limits), and destroying the can kills it. Foreground commands time out after 60 s by default.
    Browser page scripts are cut off by `scriptTimeout`. Each can is one OS process.
 7. **A crash loses memory state.** A crashed can's unsaved state is gone. A new load restores the last save.
+8. **Worker threads are allowed in the can process.** `--allow-worker` is on so that WebAssembly programs run in a worker
+   thread. Node's permission model does not cover workers in the same way, so code that escapes layer 2 could start a
+   worker that runs outside the membrane. Layer 1 was still tested as denying file reads and child processes inside a
+   worker on Node 24 (`test/vm.test.js`). Node 20 is not tested.
 
 ## Limits
 
-- **JavaScript and shell only.** Apps run on Can's own runtime (CommonJS and ES modules, with `import.meta`, top-level
+- **Memory: 700 MB per can, measured on the can's own process.** One limit covers the JavaScript heap and WebAssembly
+  memory together. Crossing it stops the can: its status is `memory-limit`, its files from the last save are kept, and
+  `can_restart` starts it again. Between 630 MB (the soft limit) and 700 MB, new `can_exec` and `can_spawn` calls are
+  refused with ENOMEM, so `can_kill` can free space first. Inside the can process, the JavaScript heap is capped at
+  600 MB (V8 old space), and each WebAssembly program at 700 MB.
+  - **Windows:** `native/win/can-memcap.exe` puts the can process in a Job Object with the 700 MB limit, and reports its
+    private memory every 250 ms. If the helper is missing, Can samples the process every second instead, and
+    `can_status` reports the enforcement as `sampled` rather than `job-object`.
+  - **macOS:** no hard cap is used. Can samples the process every second with `ps`, and the child reports its own RSS
+    every 250 ms; the larger value counts. The limit is therefore approximate: a can can overshoot 700 MB by what it allocates between two samples.
+  - **Linux:** `/proc/<pid>/status` (VmRSS) every second, the same as macOS without the child's own report.
+  - **Chrome and Edge are not counted.** They are separate host processes, not the can's process.
+- **Stuck watchdog.** A can that has requests pending and sends nothing for more than 10 s (or longer than its own timeout
+  plus 5 s) is busy-looping. Can stops it with ETIMEDOUT and status `crashed`. Its files from the last save are kept, and
+  `can_restart` starts it again.
+- **JavaScript, shell and WebAssembly only.** Python and prebuilt `.wasm` programs run as described in Python. Apps run on Can's own runtime (CommonJS and ES modules, with `import.meta`, top-level
   `await` and destructured exports) and built-in shell. The shell has `$(...)`, `if`, loops, functions and heredocs.
   Not supported: `case`, `${VAR#pat}` trimming, arrays and `[[ ]]`. `npm run` and `npm test` read the can's
   `package.json`. `npm install` works against the registry (see Environment), but install scripts and native addons do
-  not run, and packages that generate code from strings fail to load. Express loads, but a request to an Express app
-  still crashes the can: its request path uses iconv-lite's stream classes, which a can cannot subclass yet (SPEC.md
-  section 14, "Express"). Plain `http` servers work. `printf`, `echo -e` and `node -p` work. To write a file with its
+  not run, and packages that generate code from strings fail to load. Express 5 works: an app listens, parses JSON and
+  form bodies, and answers requests (SPEC.md section 14). Plain `http` servers work. `printf`, `echo -e` and `node -p` work. To write a file with its
   content, use `can_write_file`.
 - **Not Chromium, but it boots like one.** Pages get the browser APIs they probe at start-up (matchMedia, observers,
   layout queries, DOM classes, a 2D canvas context, and stubs for WebSocket, Worker, IndexedDB and geolocation) and a page's
@@ -497,6 +579,12 @@ src/browser/vp8.js      WebP lossy (VP8 key frame) decoder; vp8l.js the lossless
 src/browser/svg.js      SVG rasteriser for shapes, paths, styles and <use>
 src/browser/image.js    Picks the decoder for an image from its first bytes
 src/browser/font.js     The built-in 5x7 bitmap font used by the renderer
+src/toolchains.js       Tool lock, resolve (bundled, then cache), fetch and mirror (see Tools CLI)
+toolchains.lock.json    The tools: name, version, size, sha256 and source
+src/runtime/wasi/       WebAssembly (WASI) runner: worker thread, file bridge, memory limit
+src/runtime/pip.js      pip for a can: pure-Python wheels, sha256 checks, lock lines
+src/vm/memcap.js        Memory monitor for a can process (Job Object helper, or sampling)
+native/win/             Windows memory helper (C#, built by build.js; see its README)
 test/                   node --test suites
 packaging/              Installers: stage.mjs, agent-setup.js (skill and MCP setup), smoke-test.mjs,
                         windows/can.iss (Inno Setup), macos/ (pkg build, postinstall, uninstall)

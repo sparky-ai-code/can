@@ -4,7 +4,7 @@
 // runShellSync drives it synchronously (child_process.execSync and friends), where such a step fails
 // with ERR_NOT_SUPPORTED. Builtins are generator functions too: `yield readAll(io.stdin)` works in both.
 import { Buffer } from 'node:buffer';
-import { BUILTINS, runPathCommand, findBin } from './builtins.js';
+import { BUILTINS, runPathCommand, findBin, runWasmFile } from './builtins.js';
 import { SyncInput, Collector, FileSink, NULL_SINK } from './io.js';
 import { evalArithmetic } from './arith.js';
 
@@ -885,6 +885,7 @@ export function* invoke(argv, io, sh) {
   const fn = sh.functions.get(name);
   if (fn) return yield* callFunction(fn, args, io, sh);
   let handler = BUILTINS[name];
+  if (!handler && name.endsWith('.wasm')) handler = (a, i, s) => runWasmFile(name, a, i, s);
   if (!handler && name.includes('/')) handler = (a, i, s) => runPathCommand(name, a, i, s);
   // Like PATH: a package bin in node_modules/.bin (searched up from the working folder) runs by its bare name.
   const bin = handler ? null : findBin(name, sh);
@@ -1087,5 +1088,7 @@ export function runShellText(src, sh, io, opts = {}) {
 
 /** Synchronous variant for child_process.execSync and friends. */
 export function runShellSync(src, sh, io) {
+  // A nested program started from here cannot be waited for (no event loop), so it must report its end at once.
+  sh.syncDriver = true;
   return driveSync(runTop(src, sh, io, {}));
 }

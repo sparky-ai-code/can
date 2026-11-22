@@ -9,14 +9,20 @@
 //     network:      { internet: true|false, registry: "https://registry.npmjs.org/" }
 //     imports:      [{ hostPath, canPath, exclude?: ["node_modules", "*.log"], overwrite? }]
 //     files:        [{ path, content, encoding?: "utf8"|"base64", overwrite? }]
+//     tools:        { python: "3.15" }                      toolchains resolved from the local cache (never downloaded)
 //     requireTools: ["npm", "pnpm"]                         fail unless the can has these commands
+//     pip:          ["requests==2.32.3 --hash=sha256:<hex>"]   lock lines installed with pip during setup
 //     setup:        [{ command, timeoutMs?, optional?, label? }]   run in order, stop at the first failure
 //   }
+//
+// Steps run in this order: tools, requireTools, workdir, imports, files, pip, setup.
 import { Buffer } from 'node:buffer';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { KernelError } from './kernel/errors.js';
 import { importToCan, excludeMatcher } from './transfer.js';
 import { normalizePolicy } from './vm/policy.js';
+import { lockEntries, resolveTool } from './toolchains.js';
 
 export const LIMITS = Object.freeze({
   env: 100,
@@ -24,14 +30,18 @@ export const LIMITS = Object.freeze({
   files: 50,
   fileBytes: 1024 * 1024,
   requireTools: 20,
+  tools: 10,
+  pip: 100,
   setup: 20,
   setupTimeoutMs: 600_000,
   setupDefaultTimeoutMs: 300_000,
 });
 
-const TOP_KEYS = ['env', 'workdir', 'node', 'network', 'imports', 'files', 'requireTools', 'setup'];
+const TOP_KEYS = ['env', 'workdir', 'node', 'network', 'imports', 'files', 'tools', 'requireTools', 'pip', 'setup'];
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
+// One lock line as pip prints it: name==version --hash=sha256:<64 hex digits>. The hash is optional when typed by hand.
+const PIP_LOCK_LINE = /^([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9.!+_-]+)(?: --hash=sha256:([0-9a-f]{64}))?$/;
 
 /** The last `limit` bytes of text, for error messages. */
 const lastBytes = (text, limit) => {
@@ -133,6 +143,26 @@ export function normalizeEnvironment(spec) {
     return name;
   });
 
+  const tools = [];
+  if (spec.tools !== undefined) {
+    if (!isPlainObject(spec.tools)) throw invalid('environment.tools must be an object such as {"python": "3.15"}');
+    const names = Object.keys(spec.tools);
+    if (names.length > LIMITS.tools) throw invalid(`environment.tools takes at most ${LIMITS.tools} entries`);
+    for (const name of names) {
+      if (!TOOL_NAME.test(name)) throw invalid(`environment.tools name "${name}" is not a tool name`);
+      const version = spec.tools[name];
+      if (typeof version !== 'string' || version === '') throw invalid(`environment.tools.${name} must be a version string such as "3.15"`);
+      tools.push({ name, version });
+    }
+  }
+
+  const pip = checkList(spec.pip, 'environment.pip', LIMITS.pip).map((line, i) => {
+    if (typeof line !== 'string' || !PIP_LOCK_LINE.test(line.trim())) {
+      throw invalid(`pip[${i}] must be a lock line such as "requests==2.32.3 --hash=sha256:<hex>"`);
+    }
+    return line.trim();
+  });
+
   const setup = checkList(spec.setup, 'environment.setup', LIMITS.setup).map((item, i) => {
     if (!isPlainObject(item) || typeof item.command !== 'string' || item.command.trim() === '') {
       throw invalid(`setup[${i}] must be {command} with a non-empty command`);
@@ -150,14 +180,54 @@ export function normalizeEnvironment(spec) {
     };
   });
 
-  return { env, policy, workdir, imports, files, requireTools, setup };
+  return { env, policy, workdir, imports, files, tools, requireTools, pip, setup };
 }
 
 function emptyEnvironment() {
-  return { env: {}, policy: normalizePolicy({}), workdir: null, imports: [], files: [], requireTools: [], setup: [] };
+  return {
+    env: {}, policy: normalizePolicy({}), workdir: null, imports: [], files: [], tools: [], requireTools: [], pip: [], setup: [],
+  };
+}
+
+/** JSON with sorted keys and no whitespace, so the same value always gives the same text. */
+export function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map((v) => stableJson(v === undefined ? null : v)).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * The identity of a can's creation spec: a hash of the normalized environment and the mounts. Two creates with the
+ * same key are the same can (can_create reuses it); a different key is a conflict. Host file contents are hashed
+ * for `files`; `imports` are identified by their host path and options, not by their contents.
+ */
+export function environmentKey(spec, mounts = []) {
+  const canonical = {
+    env: spec.env,
+    policy: spec.policy,
+    workdir: spec.workdir,
+    imports: spec.imports.map((i) => ({ hostPath: i.hostPath, canPath: i.canPath, exclude: [...i.exclude].sort(), overwrite: i.overwrite })),
+    files: spec.files.map((f) => ({
+      path: f.path, sha256: createHash('sha256').update(f.bytes).digest('hex'), overwrite: f.overwrite,
+    })),
+    tools: spec.tools,
+    requireTools: spec.requireTools,
+    pip: spec.pip,
+    setup: spec.setup,
+    mounts: mounts.map((m) => ({ label: m.label, canPath: m.canPath })).sort((a, b) => stableJson(a).localeCompare(stableJson(b))),
+  };
+  return createHash('sha256').update(stableJson(canonical)).digest('hex');
 }
 
 const DEFAULT_START = '/home/agent';
+
+/** One argument for the can's shell, in single quotes (a quote inside is written as '\''). */
+export function shellQuote(text) {
+  return `'${String(text).replace(/'/g, `'\\''`)}'`;
+}
 
 /**
  * Applies a normalized environment to a freshly booted can, in this order: required tools, workdir, host imports,
@@ -166,7 +236,16 @@ const DEFAULT_START = '/home/agent';
  * @param {ReturnType<typeof normalizeEnvironment>} spec
  */
 export async function applyEnvironment(can, spec, { log = () => {} } = {}) {
-  const report = { policy: spec.policy, tools: [], workdir: spec.workdir ?? DEFAULT_START, imports: [], files: 0, setup: [] };
+  const report = {
+    policy: spec.policy, toolchains: [], tools: [], workdir: spec.workdir ?? DEFAULT_START, imports: [], files: 0, pip: [], setup: [],
+  };
+
+  // Step 1: toolchains. Resolved from the local cache only (src/toolchains.js never downloads); a missing one fails here.
+  for (const { name, version } of spec.tools) {
+    const found = await resolveTool(name, version);
+    const entry = lockEntries().find((e) => e.name === found.name && e.version === found.version);
+    report.toolchains.push({ name: found.name, version: found.version, sha256: entry?.sha256 ?? null });
+  }
 
   if (spec.requireTools.length) {
     const missing = [];
@@ -204,6 +283,17 @@ export async function applyEnvironment(can, spec, { log = () => {} } = {}) {
     report.files++;
   }
 
+  for (const line of spec.pip) {
+    log(`pip: ${line}`);
+    const tokens = line.split(/\s+/).map(shellQuote).join(' ');
+    const r = await can.exec(`pip install ${tokens}`, { cwd: report.workdir, timeout: LIMITS.setupDefaultTimeoutMs });
+    if (r.exitCode !== 0) {
+      const tail = lastBytes(`${r.stdout}${r.stderr}`, 2048);
+      throw new KernelError('EIO', `EIO: pip could not install "${line}" (exit ${r.exitCode}). Next: fix the lock line or use a pure-Python package. Output:\n${tail}`);
+    }
+    report.pip.push(line);
+  }
+
   for (const step of spec.setup) {
     const started = Date.now();
     log(`setup: ${step.label}`);
@@ -223,7 +313,9 @@ export async function applyEnvironment(can, spec, { log = () => {} } = {}) {
 export function describeReport(report) {
   const { policy } = report;
   const lines = [];
+  for (const t of report.toolchains) lines.push(`toolchain: ${t.name} ${t.version} (sha256 ${t.sha256 ?? 'unknown'})`);
   if (report.tools.length) lines.push(`tools: ${report.tools.join(', ')}`);
+  if (report.pip.length) lines.push(`pip installed ${report.pip.length} lock line(s)`);
   lines.push(`runtime: ${policy.nodeVersion ?? 'default'} (process.version)`);
   lines.push(`network: ${policy.internet ? `internet on, registry ${policy.registry}` : 'internet off'}`);
   for (const i of report.imports) {

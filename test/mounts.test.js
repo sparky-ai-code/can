@@ -9,6 +9,7 @@ import { VFS } from '../src/kernel/vfs.js';
 import { CanManager } from '../src/manager.js';
 import { readMountConfig, listMounts, resolveMounts } from '../src/mounts.js';
 import { vmExecArgv, SRC_DIR } from '../src/vm/supervisor.js';
+import { bundleDir, cacheDir, lockFilePath } from '../src/toolchains.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'can-mounts-'));
 const hostData = path.join(tmp, 'datasets');
@@ -206,6 +207,7 @@ describe('a can with mounts (CanManager)', () => {
     assert.ok(flags.includes(`--allow-fs-read=${hostData}`));
     assert.ok(flags.includes(`--allow-fs-read=${SRC_DIR}`));
     assert.ok(!flags.some((f) => f.startsWith('--allow-fs-write')));
-    assert.deepEqual(vmExecArgv({}).filter((f) => f.startsWith('--allow-fs-read')), [`--allow-fs-read=${SRC_DIR}`]);
+    // Exactly the source folder, the two toolchain folders (bundled and cached) and the tool lock file, nothing else.
+    assert.deepEqual(vmExecArgv({}).filter((f) => f.startsWith('--allow-fs-read')), [...[SRC_DIR, bundleDir(), cacheDir(), lockFilePath()].map((d) => `--allow-fs-read=${d}`)]);
   });
 });

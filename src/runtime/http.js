@@ -84,7 +84,12 @@ export class IncomingMessage extends PassThrough {
     this.httpVersionMinor = 1;
     this.complete = false;
     // A stand-in socket on the loopback address: req.ip and proxy checks read it, and it has no host behind it.
-    this.socket = { remoteAddress: '127.0.0.1', remoteFamily: 'IPv4', remotePort: 0, encrypted: false, destroyed: false };
+    // It is an EventEmitter, as a real socket is: on-finished (Express) calls socket.on(). It is readable and
+    // writable, because on-finished treats a request whose socket is not readable as already finished.
+    this.socket = Object.assign(new EventEmitter(), {
+      remoteAddress: '127.0.0.1', remoteFamily: 'IPv4', remotePort: 0, encrypted: false, destroyed: false,
+      readable: true, writable: true,
+    });
     this.connection = this.socket;
   }
 }
@@ -96,7 +101,10 @@ function makeIncomingRequest(data) {
   req.headers = data.headers;
   req.rawHeaders = Object.entries(data.headers ?? {}).flatMap(([k, v]) => [k, String(v)]);
   req.complete = true;
-  req.end(data.body);
+  // The body goes on the readable side only. Ending the writable side would make on-finished (Express) take this
+  // for a finished response message, and body-parser would then skip the body.
+  if (data.body && data.body.length > 0) req.push(data.body);
+  req.push(null);
   return req;
 }
 
