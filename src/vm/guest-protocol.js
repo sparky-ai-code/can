@@ -19,6 +19,8 @@
 //   PS 0x44     reply 0xc4: u32le count, then per program u32le id | u8 running | i32le code | u32le len | command
 //   STDIN 0x45  payload: u32le id | data  reply 0xc5, empty
 //   END_STDIN 0x46  payload: u32le id  reply 0xc6, empty
+//   PORTS 0x50  reply 0xd0: u32le count, then u32le per TCP port listening in the guest
+//   HTTP  0x51  payload: u32le port | u32le timeoutMs | the raw request  reply 0xd1: the raw response
 //   ERROR  0xff  payload: message text
 //
 // Limits: a frame is at most MAX_FRAME bytes; captured output per stream is capped by the agent (OUTPUT_CAP).
@@ -36,6 +38,8 @@ export const T = Object.freeze({
   PS: 0x44,
   STDIN: 0x45,
   END_STDIN: 0x46,
+  PORTS: 0x50,
+  HTTP: 0x51,
   REPLY: 0x80,
   ERROR: 0xff,
 });
@@ -162,6 +166,25 @@ export function decodePs(payload) {
     at += len;
   }
   return programs;
+}
+
+/** An HTTP request: the port, how long to wait for the response, and the raw request bytes. */
+export function encodeHttp({ port, timeoutMs = 30000, request }) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw protoError(`port ${port} is not 1 to 65535`);
+  const head = Buffer.alloc(8);
+  head.writeUInt32LE(port, 0);
+  head.writeUInt32LE(timeoutMs >>> 0, 4);
+  return Buffer.concat([head, Buffer.from(request)]);
+}
+
+/** Reads a PORTS reply: the TCP ports the guest is listening on. */
+export function decodePorts(payload) {
+  if (payload.length < 4) throw protoError('ports reply is too short');
+  const count = payload.readUInt32LE(0);
+  if (payload.length !== 4 + count * 4) throw protoError('ports reply does not match its count');
+  const ports = [];
+  for (let i = 0; i < count; i++) ports.push(payload.readUInt32LE(4 + i * 4));
+  return ports;
 }
 
 /** Reads an EXEC reply payload. */
