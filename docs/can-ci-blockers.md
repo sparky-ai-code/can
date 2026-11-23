@@ -21,7 +21,7 @@ the 50 MB per-file limit. Section 11 lists what is still needed.
 | 6 | `curl` exits 0 with no output | Not reproduced against github.com or example.com. The real defect fixed: curl silently ignored `-o`, `-I`, `-v`, `-w`, `-S`, `-f`, `-L`, and took `-o`'s value as the URL | `src/runtime/builtins.js` (`curl`) |
 | 7 | `res.on("data")` chunks are proxies; `Buffer.concat` throws `Received {}`; the VM crashes with `ECHILD` | Fixed | `src/vm/membrane.js` (`host`) |
 | 8 | 50 MB per-file limit: `EFBIG` on `electron.exe` (188,614,144 bytes) | Raised to 256 MB per file; memory caveat in section 8 | `src/transfer.js` (`LIMITS`) |
-| 9 | `sed` ranges unsupported; `du` absent; `grep -r` on a folder fails with `EISDIR` | Fixed for sed ranges, `du`, `grep -r`. `tar`, `zip`, `unzip` remain absent (section 9) | `src/runtime/textcmds.js` |
+| 9 | `sed` ranges unsupported; `du` absent; `grep -r` on a folder fails with `EISDIR` | Fixed for sed ranges, `du`, `grep -r`. `tar`, `gzip`, `gunzip`, `zip` and `unzip` were added after this table was written (section 9) | `src/runtime/textcmds.js`, `src/runtime/archive.js` |
 | 10 | Failed CI cans kept forever | Fixed: `can prune` and `Registry.prune`, age default 24 h | `bin/can.js` (`prune`), `src/registry.js` (`prune`) |
 
 ## 1. npm aliases
@@ -123,8 +123,10 @@ Added:
   reported (`grep: src: Is a directory`, exit 2) instead of `EISDIR`.
 - `du` with `-s` and `-h`. Sizes are in KiB, each folder rounded up, shown after its contents as `du` does.
 
-Still absent: `tar`, `zip` and `unzip` exit 127 with `command not found`. The can has no archive tools. A pipeline that
-needs an archive should create it on the host, or use a JS package in `node_modules` if one fits.
+Added: `tar` (ustar, with `-z` or a gzip file read automatically; `-c`, `-x`, `-t`, `-f`, `-C`, `-v`), `gzip`, `gunzip`
+(`-c`, `-d`, `-k`, `-f`), `zip` (`-r`, `-q`) and `unzip` (`-l`, `-o`, `-q`, `-d`). The archives are the formats the host's
+tools read. The host's bsdtar reads and writes them in the tests (`test/archive.test.js`). Extraction refuses a member
+name with `..`, and a symbolic link whose target is absolute or contains `..`.
 
 Not implemented: `sed -i`, `sed` commands other than `s`, `p`, `d`, and `grep` options beyond `-i`, `-n`, `-v`, `-r`.
 

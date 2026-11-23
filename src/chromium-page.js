@@ -243,8 +243,16 @@ export function canBrowserPage() {
     return ok({ url: location.href, title: document.title });
   }
 
+  // Links as {text, href}. The browser resolves each href to an absolute URL, so a relative link comes out whole.
+  function links() {
+    return ok([...document.querySelectorAll('a[href]')].slice(0, 500).map((a) => ({
+      text: norm(a.textContent).slice(0, 200),
+      href: a.href,
+    })));
+  }
+
   Object.defineProperty(window, '__canBrowser', {
-    value: Object.freeze({ snapshot: () => ok(snapshot()), click, type, select, submit, text, html, query, state }),
+    value: Object.freeze({ snapshot: () => ok(snapshot()), click, type, select, submit, text, html, query, links, state }),
     enumerable: false,
     configurable: false,
     writable: false,

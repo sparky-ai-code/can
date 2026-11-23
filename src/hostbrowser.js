@@ -126,11 +126,21 @@ export class HostBrowser {
     ws.onmessage = (ev) => this._onMessage(JSON.parse(String(ev.data)));
     ws.onclose = () => { this.ws = null; this.session = null; };
     this.ws = ws;
-    const { targetId } = await this._send('Target.createTarget', { url: 'about:blank' });
-    const { sessionId } = await this._send('Target.attachToTarget', { targetId, flatten: true });
-    this.session = sessionId;
-    await this._send('Page.enable');
-    await this._send('Runtime.enable');
+    const page = await this._attachNewPage();
+    this.targetId = page.targetId;
+    this.session = page.sessionId;
+  }
+
+  /**
+   * Creates a blank page target and attaches to it with its own session. The browser-level commands here take no
+   * session, so this works while another page is active (the Chromium driver opens its tabs this way).
+   */
+  async _attachNewPage() {
+    const { targetId } = await this._send('Target.createTarget', { url: 'about:blank' }, null);
+    const { sessionId } = await this._send('Target.attachToTarget', { targetId, flatten: true }, null);
+    await this._send('Page.enable', {}, sessionId);
+    await this._send('Runtime.enable', {}, sessionId);
+    return { targetId, sessionId };
   }
 
   _onMessage(msg) {

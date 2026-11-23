@@ -98,6 +98,12 @@ Each can is named by its name or id. Tool errors come back as results with `isEr
 | `browser_text` | Visible text of the page or one element |
 | `browser_query` | Elements matching a CSS selector, as JSON |
 | `browser_back` | Go back one history step; returns the snapshot |
+| `browser_links` | The links on the page as JSON `{text, href}`, each href absolute |
+| `browser_wait` | Wait up to 60 s, then return the page's url, title and status |
+| `browser_cookies` | The cookies in the can's browser as JSON |
+| `browser_new_tab` | Open a tab (optionally at a URL) and make it active; tabs are numbered from 0 |
+| `browser_select_tab` | Make the tab with this index the active one |
+| `browser_close_tab` | Close a tab (the active one by default); closing the last tab opens a blank one |
 | `browser_evaluate` | Run JavaScript in the page; returns JSON |
 | `browser_console` | Console messages, including script errors |
 | `browser_screenshot` | PNG of the page: written into the can, optionally copied to the transfer root, and returned as an image (see Screenshots) |
@@ -367,9 +373,10 @@ Only an explicit `false` turns it off; any other value, or no setting, leaves Ch
   server shuts down or the can is destroyed.
 - **Names that point at this machine are refused.** A page cannot reach a service on this machine through the proxy.
 - **Supported:** `browser_goto`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_select`,
-  `browser_submit`, `browser_text`, `browser_query`, `browser_back`, `browser_evaluate`, `browser_console` and
-  `browser_screenshot`. The screenshot is Chromium's own PNG.
-- **Not yet:** links, cookies, tabs and waits (they fail with `ENOTSUP`), WebSockets to the can, and the CLI
+  `browser_submit`, `browser_text`, `browser_query`, `browser_back`, `browser_evaluate`, `browser_console`,
+  `browser_screenshot`, `browser_links`, `browser_wait`, `browser_cookies` and the tab tools `browser_new_tab`,
+  `browser_select_tab` and `browser_close_tab`. The screenshot is Chromium's own PNG.
+- **Not yet:** WebSockets to the can, and the CLI
   commands `can browse` and `can screenshot` use the same browser setting. A can with internet access can
   reach any public host, as before.
 - **Trust:** the proxy listens on loopback with no password, so another program on this machine that knows the port

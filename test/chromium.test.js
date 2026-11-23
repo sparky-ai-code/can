@@ -185,7 +185,7 @@ describe('the Chromium backend: the tools and the setting', () => {
 
   test('an unsupported action fails with ENOTSUP instead of doing nothing', async () => {
     const hb = new ChromiumBrowsers({ executable: null }).for({ id: 'nope', policy: { internet: true }, name: 'nope' });
-    await assert.rejects(hb.browse('links'), (err) => err.code === 'ENOTSUP');
+    await assert.rejects(hb.browse('printToPdf'), (err) => err.code === 'ENOTSUP');
   });
 });
 
