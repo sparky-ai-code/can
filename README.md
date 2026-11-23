@@ -549,7 +549,7 @@ To build a Windows installer by hand, with Inno Setup 6 installed:
 
 ```powershell
 node packaging\stage.mjs --platform win32 --node <path to node.exe> --out dist\stage\windows-x64
-iscc /DAppVersion=0.1.0 /DStageDir=<full path>\dist\stage\windows-x64 /DOutDir=<full path>\dist packaging\windows\can.iss
+iscc /DAppVersion=0.2.0 /DStageDir=<full path>\dist\stage\windows-x64 /DOutDir=<full path>\dist packaging\windows\can.iss
 ```
 
 Use full paths for `StageDir` and `OutDir`: Inno Setup resolves relative ones against the script folder. On macOS,

@@ -1,12 +1,12 @@
 ; Inno Setup script for the Can installer (Windows x64). Built by .github/workflows/installers.yml, or by hand:
-;   iscc /DAppVersion=0.1.0 /DStageDir=dist\stage\windows-x64 /DOutDir=dist packaging\windows\can.iss
+;   iscc /DAppVersion=0.2.0 /DStageDir=dist\stage\windows-x64 /DOutDir=dist packaging\windows\can.iss
 ; The installer is per-user: it needs no administrator rights and installs under %LOCALAPPDATA%\Programs\Can.
 ; It installs the bundled Node runtime, the app and the can / can-mcp commands, then runs agent-setup.js install,
 ; which copies the agent skill and registers the MCP server for Claude Code and Claude Desktop. Uninstalling
 ; reverses all of that.
 
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.2.0"
 #endif
 #ifndef StageDir
   #define StageDir "..\..\dist\stage\windows-x64"
