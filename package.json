@@ -1,6 +1,6 @@
 {
   "name": "can",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Fully virtual sandbox machines for AI agents. Built from scratch, zero dependencies.",
   "type": "module",
   "private": true,

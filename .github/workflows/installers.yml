@@ -2,7 +2,7 @@ name: Installers
 
 # Builds the Windows (.exe) and macOS (.pkg) installers, installs each one on a clean runner, runs the smoke test
 # against the installed copy, then uninstalls it. Pushes to main and pull requests build and test; a version tag
-# (v0.1.0, ...) also publishes the installers and SHA256SUMS.txt to a GitHub release.
+# (v0.2.0, ...) also publishes the installers and SHA256SUMS.txt to a GitHub release.
 on:
   push:
     branches: [main]
