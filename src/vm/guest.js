@@ -9,7 +9,8 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import {
-  FrameDecoder, T, decodeExecResult, decodeHello, encodeExec, encodeFrame, encodeRead, encodeWrite,
+  FrameDecoder, T, decodeExecResult, decodeHello, decodePs, decodeStatus, encodeExec, encodeFrame, encodeKill,
+  encodeLogs, encodeProgram, encodeRead, encodeSpawn, encodeWrite,
 } from './guest-protocol.js';
 import {
   accelCandidates, buildQemuArgs, channelEndpoint, guestArchFor, vmInstalled, vmPaths,
@@ -155,6 +156,62 @@ export class Guest {
     return this.#queued(async () => {
       const reply = await this.#ask(T.READ, encodeRead(file), DEFAULT_REQUEST_MS);
       return Buffer.from(reply.payload);
+    });
+  }
+
+  /**
+   * Starts a program in the background. It keeps running after this returns, and its output is kept for logs().
+   * Resolves with the program's id, which the other calls take.
+   */
+  spawn(argv, { cwd = '' } = {}) {
+    if (!Array.isArray(argv) || argv.length === 0) throw guestError('EINVAL', 'spawn needs argv, a non-empty list');
+    return this.#queued(async () => {
+      const reply = await this.#ask(T.SPAWN, encodeSpawn({ cwd, argv }), DEFAULT_REQUEST_MS);
+      return reply.payload.readUInt32LE(0);
+    });
+  }
+
+  /** The output a background program has produced so far (its last 256 KB), as a string. stream is 'stdout' or 'stderr'. */
+  logs(id, stream = 'stdout') {
+    const code = stream === 'stderr' ? 2 : 1;
+    return this.#queued(async () => {
+      const reply = await this.#ask(T.LOGS, encodeLogs(id, code), DEFAULT_REQUEST_MS);
+      return reply.payload.toString('utf8');
+    });
+  }
+
+  /** Whether a background program is running, and its exit code once it has ended. */
+  status(id) {
+    return this.#queued(async () => decodeStatus((await this.#ask(T.STATUS, encodeProgram(id), DEFAULT_REQUEST_MS)).payload));
+  }
+
+  /**
+   * Sends a signal to a background program (SIGTERM, 15, by default). Named apart from kill(), which stops the guest.
+   * Two methods called kill would silently replace one another in the class.
+   */
+  killProgram(id, signal = 15) {
+    return this.#queued(async () => {
+      await this.#ask(T.KILL, encodeKill(id, signal), DEFAULT_REQUEST_MS);
+    });
+  }
+
+  /** Every background program the guest knows: its id, whether it runs, its exit code and its command. */
+  ps() {
+    return this.#queued(async () => decodePs((await this.#ask(T.PS, Buffer.alloc(0), DEFAULT_REQUEST_MS)).payload));
+  }
+
+  /** Writes to a background program's stdin. It waits in the guest while the program is not reading and its pipe is full. */
+  writeStdin(id, data) {
+    const bytes = typeof data === 'string' ? Buffer.from(data, 'utf8') : Buffer.from(data);
+    return this.#queued(async () => {
+      await this.#ask(T.STDIN, encodeProgram(id, bytes), DEFAULT_REQUEST_MS);
+    });
+  }
+
+  /** Closes a background program's stdin, so it reads end of input. */
+  endStdin(id) {
+    return this.#queued(async () => {
+      await this.#ask(T.END_STDIN, encodeProgram(id), DEFAULT_REQUEST_MS);
     });
   }
 

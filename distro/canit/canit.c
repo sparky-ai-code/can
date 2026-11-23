@@ -14,6 +14,15 @@
  *   POWEROFF 0x20 -> empty reply, then the machine powers off (or the process exits, in --stdio mode)
  *   WRITE 0x30   u32le mode | path\0 | data  -> empty reply. Creates or replaces the file; its folder must exist.
  *   READ  0x31   path\0  -> the file's bytes. A folder, or a file larger than one frame, is an error.
+ *   SPAWN 0x40   cwd\0 argv0\0 argv1\0 ...  -> u32le program id. The program runs in the background; its output is kept.
+ *   LOGS  0x41   u32le id | u8 stream (1 out, 2 err)  -> the kept output: the last 256 KB of that stream.
+ *   STATUS 0x42  u32le id  -> u8 running | i32le exit code (0 while it runs).
+ *   KILL  0x43   u32le id | i32le signal  -> empty. An ERROR if the program has already exited.
+ *   PS    0x44   -> u32le count, then per program: u32le id | u8 running | i32le code | u32le len | command.
+ *   STDIN 0x45   u32le id | data  -> empty. Writes to the program's stdin; blocks while the program is not reading.
+ *   END_STDIN 0x46  u32le id  -> empty. Closes the program's stdin, so it sees end of input.
+ * Background programs share the agent with exec. At most 64 at once. While an EXEC runs, background output waits in
+ * its pipes, so a program that writes a lot then blocks until the next request is served.
  *
  * Known limits of this first version, kept on purpose:
  *   - one request at a time: an EXEC blocks the agent until the command ends (concurrent exec, spawn, files, ports are next);
@@ -48,7 +57,11 @@
 #define OUTPUT_CAP (1024u * 1024u)
 #define AGENT_PORT "can.agent"
 
-enum { T_HELLO = 0x01, T_PING = 0x02, T_EXEC = 0x10, T_POWEROFF = 0x20, T_WRITE = 0x30, T_READ = 0x31, T_REPLY = 0x80, T_ERROR = 0xff };
+enum {
+  T_HELLO = 0x01, T_PING = 0x02, T_EXEC = 0x10, T_POWEROFF = 0x20, T_WRITE = 0x30, T_READ = 0x31,
+  T_SPAWN = 0x40, T_LOGS = 0x41, T_STATUS = 0x42, T_KILL = 0x43, T_PS = 0x44, T_STDIN = 0x45, T_END_STDIN = 0x46,
+  T_REPLY = 0x80, T_ERROR = 0xff
+};
 
 static int in_fd = 0, out_fd = 1;
 static int is_init = 0;
@@ -130,6 +143,7 @@ static void do_exec(uint32_t id, const uint8_t *payload, uint32_t len) {
   pid_t pid = fork();
   if (pid < 0) { free(argv); send_error(id, "exec: fork failed"); return; }
   if (pid == 0) {
+    signal(SIGPIPE, SIG_DFL); /* the agent ignores SIGPIPE; a program must not inherit that */
     int dn = open("/dev/null", O_RDONLY);
     if (dn >= 0) { dup2(dn, 0); close(dn); }
     dup2(po[1], 1); dup2(pe[1], 2);
@@ -275,8 +289,256 @@ static void do_read(uint32_t id, const uint8_t *payload, uint32_t len) {
   free(buf);
 }
 
-static void reap_orphans(void) {
-  while (waitpid(-1, NULL, WNOHANG) > 0) {}
+/* ---- background programs ---- */
+
+#define MAX_BG 64
+#define BG_LOG_CAP (256u * 1024u) /* per stream; the oldest output is dropped past this */
+
+typedef struct {
+  uint32_t id;  /* 0 = a free slot */
+  pid_t pid;
+  int running;
+  int32_t code;
+  int in_fd;    /* the host's end of the program's stdin; -1 once closed */
+  int out_fd;   /* read ends of the program's stdout and stderr; -1 once they reach end of file */
+  int err_fd;
+  buf_t out, err;
+  char *cmd;
+} bg_t;
+
+static bg_t bg[MAX_BG];
+static uint32_t bg_next_id = 1;
+
+static void bg_release(bg_t *p) {
+  free(p->out.data);
+  free(p->err.data);
+  free(p->cmd);
+  memset(p, 0, sizeof *p);
+}
+
+/* Appends to a log, keeping only its last BG_LOG_CAP bytes. */
+static void bg_keep_tail(buf_t *b, const uint8_t *src, size_t n) {
+  if (n > BG_LOG_CAP) { src += n - BG_LOG_CAP; n = BG_LOG_CAP; }
+  if (b->len + n > BG_LOG_CAP) {
+    size_t drop = b->len + n - BG_LOG_CAP;
+    memmove(b->data, b->data + drop, b->len - drop);
+    b->len -= drop;
+  }
+  uint8_t *grown = realloc(b->data, b->len + n);
+  if (!grown) return;
+  memcpy(grown + b->len, src, n);
+  b->data = grown;
+  b->len += n;
+}
+
+/* Reads what is waiting on one output pipe. End of file closes it. */
+static void bg_read_fd(int *fd, buf_t *b) {
+  uint8_t chunk[16384];
+  ssize_t n = read(*fd, chunk, sizeof chunk);
+  if (n > 0) { bg_keep_tail(b, chunk, (size_t)n); return; }
+  if (n < 0 && (errno == EINTR || errno == EAGAIN)) return;
+  close(*fd);
+  *fd = -1;
+}
+
+static void bg_drain(int fd) {
+  for (size_t i = 0; i < MAX_BG; i++) {
+    if (bg[i].id == 0) continue;
+    if (bg[i].out_fd == fd) { bg_read_fd(&bg[i].out_fd, &bg[i].out); return; }
+    if (bg[i].err_fd == fd) { bg_read_fd(&bg[i].err_fd, &bg[i].err); return; }
+  }
+}
+
+/* Records how a background program ended. It can no longer take stdin. */
+static void bg_exited(pid_t pid, int status) {
+  for (size_t i = 0; i < MAX_BG; i++) {
+    if (bg[i].id && bg[i].running && bg[i].pid == pid) {
+      bg[i].running = 0;
+      bg[i].code = WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
+      if (bg[i].in_fd >= 0) { close(bg[i].in_fd); bg[i].in_fd = -1; }
+      return;
+    }
+  }
+}
+
+/* Reaps every child that has ended. Background programs get their status recorded; exec's children are reaped by
+ * do_exec, which is never running at the same time. */
+static void reap_children(void) {
+  int status;
+  pid_t pid;
+  while ((pid = waitpid(-1, &status, WNOHANG)) > 0) bg_exited(pid, status);
+}
+
+/* A free slot, or a finished program whose output has been read to the end (its logs are dropped then). */
+static bg_t *bg_slot(void) {
+  for (size_t i = 0; i < MAX_BG; i++) if (bg[i].id == 0) return &bg[i];
+  for (size_t i = 0; i < MAX_BG; i++) {
+    if (!bg[i].running && bg[i].in_fd < 0 && bg[i].out_fd < 0 && bg[i].err_fd < 0) {
+      bg_release(&bg[i]);
+      return &bg[i];
+    }
+  }
+  return NULL;
+}
+
+static bg_t *bg_find(uint32_t id) {
+  for (size_t i = 0; i < MAX_BG; i++) if (bg[i].id && bg[i].id == id) return &bg[i];
+  return NULL;
+}
+
+static void close_pair(int p[2]) {
+  if (p[0] >= 0) close(p[0]);
+  if (p[1] >= 0) close(p[1]);
+}
+
+static char *join_argv(char **argv, size_t argc) {
+  size_t total = 1;
+  for (size_t i = 0; i < argc; i++) total += strlen(argv[i]) + 1;
+  char *s = malloc(total);
+  if (!s) return NULL;
+  s[0] = '\0';
+  for (size_t i = 0; i < argc; i++) {
+    if (i) strcat(s, " ");
+    strcat(s, argv[i]);
+  }
+  return s;
+}
+
+/* SPAWN: cwd\0 argv0\0 argv1\0 ... -> u32le program id. The pipes are close-on-exec, so no program inherits another's. */
+static void do_spawn(uint32_t id, const uint8_t *payload, uint32_t len) {
+  if (len < 2 || payload[len - 1] != '\0') { send_error(id, "spawn: strings are not NUL terminated"); return; }
+  const char *p = (const char *)payload, *end = (const char *)payload + len;
+  const char *cwd = p;
+  p += strlen(p) + 1;
+  size_t argc = 0;
+  for (const char *q = p; q < end; q += strlen(q) + 1) argc++;
+  if (argc == 0) { send_error(id, "spawn: no command"); return; }
+  bg_t *slot = bg_slot();
+  if (!slot) { send_error(id, "spawn: too many background programs (limit 64)"); return; }
+  char **argv = calloc(argc + 1, sizeof *argv);
+  if (!argv) { send_error(id, "spawn: out of memory"); return; }
+  size_t i = 0;
+  for (const char *q = p; q < end; q += strlen(q) + 1) argv[i++] = (char *)q;
+
+  int pin[2] = {-1, -1}, pout[2] = {-1, -1}, perr[2] = {-1, -1};
+  if (pipe2(pin, O_CLOEXEC) < 0 || pipe2(pout, O_CLOEXEC) < 0 || pipe2(perr, O_CLOEXEC) < 0) {
+    close_pair(pin); close_pair(pout); close_pair(perr);
+    free(argv);
+    send_error(id, "spawn: pipe failed");
+    return;
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    close_pair(pin); close_pair(pout); close_pair(perr);
+    free(argv);
+    send_error(id, "spawn: fork failed");
+    return;
+  }
+  if (pid == 0) {
+    dup2(pin[0], 0);
+    dup2(pout[1], 1);
+    dup2(perr[1], 2);
+    signal(SIGPIPE, SIG_DFL);
+    if (cwd[0] && chdir(cwd) < 0) { dprintf(2, "canit: cannot chdir to %s: %s\n", cwd, strerror(errno)); _exit(126); }
+    execvp(argv[0], argv);
+    dprintf(2, "canit: cannot run %s: %s\n", argv[0], strerror(errno));
+    _exit(errno == ENOENT ? 127 : 126);
+  }
+  close(pin[0]);
+  close(pout[1]);
+  close(perr[1]);
+  fcntl(pout[0], F_SETFL, O_NONBLOCK);
+  fcntl(perr[0], F_SETFL, O_NONBLOCK);
+  char *cmd = join_argv(argv, argc);
+  free(argv);
+  slot->id = bg_next_id++;
+  slot->pid = pid;
+  slot->running = 1;
+  slot->code = 0;
+  slot->in_fd = pin[1];
+  slot->out_fd = pout[0];
+  slot->err_fd = perr[0];
+  slot->cmd = cmd;
+  uint8_t b[4];
+  put_u32(b, slot->id);
+  send_frame(T_SPAWN | T_REPLY, id, b, 4);
+}
+
+static void do_logs(uint32_t id, const uint8_t *payload, uint32_t len) {
+  if (len != 5) { send_error(id, "logs: the request is a program id and a stream (1 out, 2 err)"); return; }
+  bg_t *p = bg_find(get_u32(payload));
+  if (!p) { send_error(id, "logs: no such background program"); return; }
+  if (payload[4] != 1 && payload[4] != 2) { send_error(id, "logs: the stream is 1 (stdout) or 2 (stderr)"); return; }
+  buf_t *b = payload[4] == 1 ? &p->out : &p->err;
+  send_frame(T_LOGS | T_REPLY, id, b->data, (uint32_t)b->len);
+}
+
+static void do_status(uint32_t id, const uint8_t *payload, uint32_t len) {
+  if (len != 4) { send_error(id, "status: the request is a program id"); return; }
+  bg_t *p = bg_find(get_u32(payload));
+  if (!p) { send_error(id, "status: no such background program"); return; }
+  uint8_t b[5];
+  b[0] = p->running ? 1 : 0;
+  put_u32(b + 1, (uint32_t)p->code);
+  send_frame(T_STATUS | T_REPLY, id, b, 5);
+}
+
+static void do_kill(uint32_t id, const uint8_t *payload, uint32_t len) {
+  if (len != 8) { send_error(id, "kill: the request is a program id and a signal"); return; }
+  bg_t *p = bg_find(get_u32(payload));
+  if (!p) { send_error(id, "kill: no such background program"); return; }
+  if (!p->running) { send_error(id, "kill: the program has already exited"); return; }
+  if (kill(p->pid, (int)get_u32(payload + 4)) < 0) {
+    char msg[256];
+    snprintf(msg, sizeof msg, "kill: %s", strerror(errno));
+    send_error(id, msg);
+    return;
+  }
+  send_frame(T_KILL | T_REPLY, id, NULL, 0);
+}
+
+static void do_ps(uint32_t id) {
+  uint32_t count = 0;
+  for (size_t i = 0; i < MAX_BG; i++) if (bg[i].id) count++;
+  buf_t out = {0};
+  uint8_t head[4];
+  put_u32(head, count);
+  buf_add(&out, head, 4);
+  for (size_t i = 0; i < MAX_BG; i++) {
+    if (!bg[i].id) continue;
+    size_t cl = strlen(bg[i].cmd);
+    uint8_t rec[13];
+    put_u32(rec, bg[i].id);
+    rec[4] = bg[i].running ? 1 : 0;
+    put_u32(rec + 5, (uint32_t)bg[i].code);
+    put_u32(rec + 9, (uint32_t)cl);
+    buf_add(&out, rec, sizeof rec);
+    buf_add(&out, (const uint8_t *)bg[i].cmd, cl);
+  }
+  send_frame(T_PS | T_REPLY, id, out.data, (uint32_t)out.len);
+  free(out.data);
+}
+
+static void do_stdin(uint32_t id, const uint8_t *payload, uint32_t len) {
+  if (len < 4) { send_error(id, "stdin: the request is a program id and data"); return; }
+  bg_t *p = bg_find(get_u32(payload));
+  if (!p) { send_error(id, "stdin: no such background program"); return; }
+  if (p->in_fd < 0) { send_error(id, "stdin: the program's stdin is closed"); return; }
+  if (write_full(p->in_fd, payload + 4, len - 4) < 0) {
+    char msg[256];
+    snprintf(msg, sizeof msg, "stdin: %s", strerror(errno));
+    send_error(id, msg);
+    return;
+  }
+  send_frame(T_STDIN | T_REPLY, id, NULL, 0);
+}
+
+static void do_end_stdin(uint32_t id, const uint8_t *payload, uint32_t len) {
+  if (len != 4) { send_error(id, "end_stdin: the request is a program id"); return; }
+  bg_t *p = bg_find(get_u32(payload));
+  if (!p) { send_error(id, "end_stdin: no such background program"); return; }
+  if (p->in_fd >= 0) { close(p->in_fd); p->in_fd = -1; }
+  send_frame(T_END_STDIN | T_REPLY, id, NULL, 0);
 }
 
 static void power_off(void) {
@@ -287,11 +549,24 @@ static void power_off(void) {
 
 static void serve(void) {
   for (;;) {
-    struct pollfd pfd = {in_fd, POLLIN, 0};
-    int r = poll(&pfd, 1, 1000);
-    if (is_init) reap_orphans();
+    /* Watch the host's channel and every background program's output, so that a program never blocks on a full pipe
+     * while the host is idle. The timeout also reaps children that have ended. */
+    struct pollfd pfds[1 + 2 * MAX_BG];
+    nfds_t n = 0;
+    pfds[n++] = (struct pollfd){in_fd, POLLIN, 0};
+    for (size_t i = 0; i < MAX_BG; i++) {
+      if (bg[i].id == 0) continue;
+      if (bg[i].out_fd >= 0) pfds[n++] = (struct pollfd){bg[i].out_fd, POLLIN, 0};
+      if (bg[i].err_fd >= 0) pfds[n++] = (struct pollfd){bg[i].err_fd, POLLIN, 0};
+    }
+    int r = poll(pfds, n, 200);
+    reap_children();
     if (r < 0 && errno == EINTR) continue;
-    if (r == 0) continue;
+    if (r < 0) { usleep(10000); continue; }
+    for (nfds_t k = 1; k < n; k++) {
+      if (pfds[k].revents & (POLLIN | POLLHUP | POLLERR)) bg_drain(pfds[k].fd);
+    }
+    if (!(pfds[0].revents & (POLLIN | POLLHUP | POLLERR))) continue;
     uint8_t head[4];
     int got = read_full(in_fd, head, 4);
     if (got == 0) { if (is_init) { usleep(50000); continue; } return; }
@@ -317,6 +592,13 @@ static void serve(void) {
       case T_EXEC: do_exec(id, payload, plen); break;
       case T_WRITE: do_write(id, payload, plen); break;
       case T_READ: do_read(id, payload, plen); break;
+      case T_SPAWN: do_spawn(id, payload, plen); break;
+      case T_LOGS: do_logs(id, payload, plen); break;
+      case T_STATUS: do_status(id, payload, plen); break;
+      case T_KILL: do_kill(id, payload, plen); break;
+      case T_PS: do_ps(id); break;
+      case T_STDIN: do_stdin(id, payload, plen); break;
+      case T_END_STDIN: do_end_stdin(id, payload, plen); break;
       case T_POWEROFF: send_frame(T_POWEROFF | T_REPLY, id, NULL, 0); free(body); power_off(); return;
       default: {
         char msg[64];

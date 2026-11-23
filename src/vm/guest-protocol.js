@@ -12,6 +12,13 @@
 //   POWEROFF 0x20  the agent syncs, replies 0xa0, then powers the machine off
 //   WRITE  0x30  payload: u32le mode | path\0 | data. Creates or replaces the file (its folder must exist). reply 0xb0, empty
 //   READ   0x31  payload: path\0. reply 0xb1 carries the file's bytes. A folder or a file over one frame is an error
+//   SPAWN 0x40  payload: cwd\0 argv0\0 ...  reply 0xc0: u32le program id. The program runs in the background.
+//   LOGS 0x41   payload: u32le id | u8 stream (1 out, 2 err)  reply 0xc1: the kept output (last 256 KB)
+//   STATUS 0x42 payload: u32le id  reply 0xc2: u8 running | i32le exit code
+//   KILL 0x43   payload: u32le id | i32le signal  reply 0xc3, empty
+//   PS 0x44     reply 0xc4: u32le count, then per program u32le id | u8 running | i32le code | u32le len | command
+//   STDIN 0x45  payload: u32le id | data  reply 0xc5, empty
+//   END_STDIN 0x46  payload: u32le id  reply 0xc6, empty
 //   ERROR  0xff  payload: message text
 //
 // Limits: a frame is at most MAX_FRAME bytes; captured output per stream is capped by the agent (OUTPUT_CAP).
@@ -22,6 +29,13 @@ export const T = Object.freeze({
   POWEROFF: 0x20,
   WRITE: 0x30,
   READ: 0x31,
+  SPAWN: 0x40,
+  LOGS: 0x41,
+  STATUS: 0x42,
+  KILL: 0x43,
+  PS: 0x44,
+  STDIN: 0x45,
+  END_STDIN: 0x46,
   REPLY: 0x80,
   ERROR: 0xff,
 });
@@ -97,6 +111,57 @@ export function encodeWrite({ path, data, mode = 0o644 }) {
 /** A READ request: the payload is the path. The reply payload is the file's bytes. */
 export function encodeRead(path) {
   return cstr(path, 'path');
+}
+
+/** A SPAWN request: starts a background program. The reply payload is its u32le id. */
+export function encodeSpawn({ cwd = '', argv }) {
+  if (!Array.isArray(argv) || argv.length === 0) throw protoError('spawn needs argv, a non-empty list');
+  return Buffer.concat([cstr(cwd, 'cwd'), ...argv.map((a, i) => cstr(a, `argv[${i}]`))]);
+}
+
+/** A request that names a background program: u32le id, then whatever the request adds (see encodeLogs and so on). */
+export function encodeProgram(id, extra = Buffer.alloc(0)) {
+  const head = Buffer.alloc(4);
+  head.writeUInt32LE(id >>> 0, 0);
+  return Buffer.concat([head, Buffer.from(extra)]);
+}
+
+/** A LOGS request payload: the program id and the stream, 1 for stdout or 2 for stderr. */
+export function encodeLogs(id, stream) {
+  return encodeProgram(id, Buffer.from([stream]));
+}
+
+/** A KILL request payload: the program id and a signal number. */
+export function encodeKill(id, signal) {
+  const sig = Buffer.alloc(4);
+  sig.writeInt32LE(signal, 0);
+  return encodeProgram(id, sig);
+}
+
+/** Reads a STATUS reply: whether the program is running, and its exit code (0 while it runs). */
+export function decodeStatus(payload) {
+  if (payload.length !== 5) throw protoError('status reply is not 5 bytes');
+  return { running: payload.readUInt8(0) === 1, exitCode: payload.readInt32LE(1) };
+}
+
+/** Reads a PS reply: every program the agent knows, its state and its command. */
+export function decodePs(payload) {
+  if (payload.length < 4) throw protoError('ps reply is too short');
+  const count = payload.readUInt32LE(0);
+  const programs = [];
+  let at = 4;
+  for (let i = 0; i < count; i++) {
+    if (at + 13 > payload.length) throw protoError('ps reply is cut short');
+    const id = payload.readUInt32LE(at);
+    const running = payload.readUInt8(at + 4) === 1;
+    const exitCode = payload.readInt32LE(at + 5);
+    const len = payload.readUInt32LE(at + 9);
+    at += 13;
+    if (at + len > payload.length) throw protoError('ps reply is cut short');
+    programs.push({ id, running, exitCode, command: payload.subarray(at, at + len).toString('utf8') });
+    at += len;
+  }
+  return programs;
 }
 
 /** Reads an EXEC reply payload. */
