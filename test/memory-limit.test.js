@@ -79,7 +79,7 @@ describe('memory info of a can (src/can.js, src/vm/supervisor.js)', () => {
     assert.ok(flags.includes('--max-old-space-size=600'));
   });
 
-  test('the VM process may read the bundled and cached toolchain folders (and nothing is writable)', () => {
+  test('the VM process may read the bundled and cached toolchain folders (and nothing is writable)', (t) => {
     const script = 'const r = process.argv.slice(1); console.log(JSON.stringify(r.map((d) => process.permission.has("fs.read", d))))';
     const reads = vmExecArgv({}).filter((f) => f.startsWith('--allow-fs-read=')).map((f) => f.slice('--allow-fs-read='.length));
     assert.ok(reads.length >= 4, 'the source, bundled and cache folders and the lock file are listed');
@@ -95,11 +95,18 @@ describe('memory info of a can (src/can.js, src/vm/supervisor.js)', () => {
     // The real reads the toolchain code makes: the lock file and the contents of the bundled tool folder.
     const lockDoc = JSON.parse(fs.readFileSync(reads.find((p) => p.endsWith('toolchains.lock.json')), 'utf8'));
     const bundle = path.join(reads.find((p) => p.endsWith('toolchains')), lockDoc.entries[0].sha256);
-    const real = spawnSync(process.execPath, [...vmExecArgv({}), '-e',
-      'const fs = require("node:fs"); const [lock, dir] = process.argv.slice(1); console.log(fs.readFileSync(lock, "utf8").length > 0, fs.readdirSync(dir).length > 0)',
-      reads.find((p) => p.endsWith('toolchains.lock.json')), bundle], { encoding: 'utf8' });
-    assert.equal(real.status, 0, real.stderr);
-    assert.equal(real.stdout.trim(), 'true true');
+    // Tools are downloaded only by `can tools fetch` (opt-in), so a checkout or a CI runner may not have the
+    // bundled CPython. The grants above are still checked; the real read needs the file, so it runs only when it exists.
+    if (fs.existsSync(bundle)) {
+      const real = spawnSync(process.execPath, [...vmExecArgv({}), '-e',
+        'const fs = require("node:fs"); const [lock, dir] = process.argv.slice(1); console.log(fs.readFileSync(lock, "utf8").length > 0, fs.readdirSync(dir).length > 0)',
+        reads.find((p) => p.endsWith('toolchains.lock.json')), bundle], { encoding: 'utf8' });
+      assert.equal(real.status, 0, real.stderr);
+      assert.equal(real.stdout.trim(), 'true true');
+
+    } else {
+      t.diagnostic('skipped the real read: the bundled CPython is not on this machine (fetch it with `can tools fetch python`)');
+    }
     const write = spawnSync(process.execPath, [...vmExecArgv({}), '-e', 'process.permission.has("fs.write", process.argv[1]) ? console.log("W") : console.log("R")', reads[1]], { encoding: 'utf8' });
     assert.equal(write.stdout.trim(), 'R');
   });

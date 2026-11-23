@@ -542,7 +542,7 @@ These are stated plainly, from `SPEC.md` section 10.4:
 
 The Windows and macOS installers are built by `.github/workflows/installers.yml`. Each one bundles the pinned Node
 runtime (`BUNDLED_NODE_VERSION` in that file, checked against nodejs.org's SHA256SUMS), the app, the skill and the
-setup script. The workflow installs each package on a clean runner, runs `packaging/smoke-test.mjs` against it,
+setup script. The workflow installs each package on a clean runner, runs `packaging/smoke.mjs` against it,
 and uninstalls it. Pushing a `v*` tag also publishes the installers and `SHA256SUMS.txt` as a release.
 
 To build a Windows installer by hand, with Inno Setup 6 installed:
@@ -586,7 +586,7 @@ src/runtime/pip.js      pip for a can: pure-Python wheels, sha256 checks, lock l
 src/vm/memcap.js        Memory monitor for a can process (Job Object helper, or sampling)
 native/win/             Windows memory helper (C#, built by build.js; see its README)
 test/                   node --test suites
-packaging/              Installers: stage.mjs, agent-setup.js (skill and MCP setup), smoke-test.mjs,
+packaging/              Installers: stage.mjs, agent-setup.js (skill and MCP setup), smoke.mjs,
                         windows/can.iss (Inno Setup), macos/ (pkg build, postinstall, uninstall)
 SPEC.md                 Architecture and binding interface spec
 ```
