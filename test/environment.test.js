@@ -131,7 +131,7 @@ describe('applying an environment to a can', () => {
 
   test('without a node setting the can reports the runtime default', async () => {
     const can = await manager.create({ name: nameFor('default-node') });
-    assert.equal((await can.exec('node -p process.version')).stdout, 'v20.11.0\n');
+    assert.equal((await can.exec('node -p process.version')).stdout, 'v24.15.0\n');
   });
 
   test('a host folder is copied in without its excluded entries', async () => {

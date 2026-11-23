@@ -731,7 +731,7 @@ half-set-up can. `can.report` keeps what happened, and `describeReport` prints i
 - `internet` (default true): when false, the browser, `curl`, the JS `http`/`https` modules and `npm` all refuse
   outbound requests with `EPERM` (or curl exit 7). The check is in the runtime, not in the host.
 - `registry` (default `https://registry.npmjs.org/`): where `npm` reads packuments and tarballs. An http or https URL.
-- `nodeVersion` (default: the runtime's `v20.11.0`): what `process.version` and `process.versions.node` report. The
+- `nodeVersion` (default: the runtime's `v24.15.0`, so Sparky's server finds the `node:sqlite` APIs it needs): what `process.version` and `process.versions.node` report. The
   can's JavaScript runs on the host's Node engine either way, so this changes what an app sees, not what the engine
   supports.
 
@@ -745,8 +745,11 @@ become shims in `node_modules/.bin` that run the bin file with `argv[1]` set to 
 
 Not done, and reported as warnings or errors rather than guessed at: install scripts (`preinstall`, `install`,
 `postinstall`) never run; native addons cannot load (the VM may not `dlopen`); peer dependencies are not installed;
-git, file and workspace specs are refused; there is no lockfile, and no pruning of packages removed from package.json
-by hand. `pnpm` workspaces (`-r`, `-w`, `--filter`, `pnpm-workspace.yaml`) are refused.
+git and file specs are refused. `workspace:` specs link a sibling package listed by pnpm-workspace.yaml `packages:` (its
+folder is copied, without node_modules and .git; symbolic links are reported, not copied), and `catalog:` specs and
+`overrides` come from pnpm-workspace.yaml and package.json (parent>child overrides are ignored). A pnpm-lock.yaml and
+npm's lockfile are not read, so versions come from the ranges in package.json, and packages removed from package.json
+are not pruned by hand. `pnpm` workspace commands (`-r`, `-w`, `--filter`) are refused.
 
 **Shebangs.** A `#!` first line is blanked before a module is wrapped (`stripShebang` in `src/runtime/js.js`), so bin
 scripts with `#!/usr/bin/env node` load. Line numbers are unchanged.
@@ -783,6 +786,18 @@ finished (`src/vm/membrane.js` `_hostWrapper`; `test/membrane-hosts.test.js`).
 **`http` classes.** `http.IncomingMessage` (a PassThrough subclass) and `http.ServerResponse` are exported, and
 `http.OutgoingMessage` is the same as `ServerResponse`. Requests are `IncomingMessage` instances with a loopback
 `socket`, so `req.ip` and proxy checks work.
+
+**Node APIs added for a server's boot** (`src/runtime/console.js`, `src/runtime/modules.js`):
+- `console` has `group`/`groupEnd`, `table`, `count`, `time`/`timeEnd`, `assert`, `trace` and `dir`, both as the global and as the
+  `console` module (one implementation).
+- `fs` has file descriptors: `openSync`/`open`, `readSync`/`read`, `writeSync`/`write`, `fstatSync`, `ftruncateSync`, `closeSync`,
+  `fsync`, `fdatasync`, and `fs.promises.open` returning a `FileHandle`. Descriptors start at 3, and the table is shared by `fs` and
+  `fs/promises`. Bytes live in the VFS, so each read sees the latest write. Also `mkdtemp`, `truncate`, `watch` and `chown`.
+  `watch` checks the path exists and returns an emitter that never fires (no file watching in a can). `chown` does nothing (a can
+  has no users). `link` fails with `ENOTSUP`, since the VFS has no inodes.
+- A child process emits `'spawn'` on the next turn, before its output and exit, as node does. A command that is not found still
+  exits 127 through the shell; Effect's process spawner waits for `'spawn'` before it reads the result.
+- The reported Node version defaults to `v24.15.0` (`src/runtime/js.js`). A can created earlier keeps the version saved on it.
 
 ## 14.1 CI pipelines (`src/ci.js`, `bin/can.js ci`, `can_ci`) [impl]
 
@@ -834,11 +849,35 @@ first missing API.
 - `FileReader`, `File`, `Blob`, `FormData`, `crypto.randomUUID`/`getRandomValues`, `structuredClone`, `console.table`,
   `console.group`, `console.time`, `navigator.clipboard`, `getComputedStyle` (inline style and default display only).
 
+**Added for a real app's boot (Sparky's UI renders, see `examples/sparky-boot/README.md`):**
+- `MessageChannel`: two linked ports; a message is delivered on a later turn, to `onmessage` and to `'message'` listeners (React's
+  scheduler uses it).
+- `customElements`: `define`, `get`, `whenDefined`, `upgrade`. A registered element stays a plain element (no upgrade).
+- `document.createElementNS` creates an element by its qualified name (SVG and MathML are drawn as elements); `getAnimations()`
+  returns `[]` and `animate()` returns a finished animation. Nothing is animated.
+- `:hover`, `:active`, `:focus`, `:focus-visible`, `:focus-within`, `:visited` and `:target` are valid selectors that never match:
+  the renderer has no pointer, focus or history state.
+- `children` is a list with `item()` and `namedItem()`, as an `HTMLCollection` has.
+- Browser classes this renderer does not implement exist as names: `instanceof X` works, and `new X()` throws a `TypeError`
+  saying it is not available. `DOMException` is real. The list is `NOT_IMPLEMENTED` in `src/browser/webapis.js`.
+- Page modules are minified bundles: an `import` or `export` may follow a `;` or `}` on the same line. The browser's module path
+  (`toCommonJs` with `statementStarts`, `src/runtime/esm.js`) recognises them; the server's own module path does not change.
+
 **Stubs (they never throw; they report failure the way a browser does):**
-- `WebSocket` is closed and fires `error` and `close`. `Worker` fires `error`. `indexedDB.open` fires `error`.
+- `Worker` fires `error`. `indexedDB.open` fires `error`. `WebSocket` is real for the can's own hosts (see below).
 - `navigator.geolocation` reports denial. `Notification` is denied. `navigator.sendBeacon` returns true.
 - `video` and `audio` methods resolve without playing. `iframe` is not loaded.
 - `getComputedStyle` does not apply `<style>` rules.
+
+**WebSocket.** A page's `WebSocket` is a real RFC 6455 client (`src/browser/websocket.js`) for `ws://` URLs whose host is the can's
+own (`localhost`, `127.0.0.1`, the can's name). The connection is a raw vnet connection (`VNet.connect`), so it reaches the same
+port as page HTTP. The can's http `Server` (`src/runtime/http.js`, `acceptRaw`) reads the upgrade request from it and emits
+`'upgrade'` with `(req, socket, head)`; `socket` is the duplex with the `net.Socket` members the `ws` library uses, and `head` holds
+bytes sent in the same packet as the request. A server with no `'upgrade'` listener destroys the socket. An upgrade-headed
+request that arrives as a whole HTTP request gets 426. Limits: `wss://` and other hosts fail with `error`, then `close` 1006;
+no extensions (no permessage-deflate); binary messages are always delivered as `ArrayBuffer` (`binaryType` is stored but not
+used); `send` takes a string, an ArrayBuffer or a view, not a Blob; no cookies are sent on the handshake; a socket is not
+closed when the page navigates away.
 
 **Errors.** A failing script is logged and the next script still runs. An unhandled promise rejection in a page is logged in
 the console. In the can, the VM worker keeps running (before this, one such rejection ended the can's process).

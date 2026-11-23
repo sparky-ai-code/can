@@ -174,11 +174,18 @@ export class VFS {
    * @param {() => number} [opts.clock=Date.now] time source in ms
    */
   constructor({ cwd = '/', clock = Date.now } = {}) {
+    // Counts every change to the tree, the mounts and the cwd. A save is skipped while this has not moved since the
+    // last one (see CanManager.save). Every mutator bumps it before it touches the tree, so an over-count is only a
+    // wasted write, never a missed one. Machine.generation adds the restore epoch to it.
+    this.generation = 0;
     this.clock = clock;
     this.root = newDir(clock());
-    this.cwd = posix.resolve('/', cwd);
+    this._cwd = posix.resolve('/', cwd);
     this.mounts = []; // [{path, label}] host folders mounted read-only (see mount)
   }
+
+  get cwd() { return this._cwd; }
+  set cwd(p) { this._cwd = p; this.generation++; }
 
   /**
    * Mounts a host folder read-only at p. The can then sees the folder's current contents at p, and every
@@ -275,6 +282,7 @@ export class VFS {
   appendFile(p, data, opts = {}) { this._write(p, toBuffer(data, opts.encoding), opts, true); }
 
   _write(p, buf, opts, append) {
+    this.generation++;
     const abs = this.resolve(p);
     const c = ctx('open', p);
     const node = this._find(abs, true, c);
@@ -304,12 +312,14 @@ export class VFS {
   }
 
   chmod(p, mode) {
+    this.generation++;
     const node = this._lookup(this.resolve(p), true, ctx('chmod', p));
     node.mode = mode & 0o7777;
     node.ctime = this.clock();
   }
 
   utimes(p, mtime) {
+    this.generation++;
     const node = this._lookup(this.resolve(p), true, ctx('utime', p));
     node.mtime = new Date(mtime).getTime();
     node.ctime = this.clock();
@@ -507,6 +517,7 @@ export class VFS {
 
   /** Attaches a new node at abs. Fails with EEXIST if the name is taken (dangling links included). */
   _create(abs, c, node) {
+    this.generation++;
     const { dir, name } = this._parentOf(abs, c);
     if (dir.entries.has(name)) throw fail('EEXIST', c);
     dir.entries.set(name, node);
@@ -514,6 +525,7 @@ export class VFS {
   }
 
   _detach(dir, name) {
+    this.generation++;
     const node = dir.entries.get(name);
     if (node?.isRoot) throw fsError('EROFS', 'rm', node.canPath);
     dir.entries.delete(name);
@@ -537,6 +549,7 @@ export class VFS {
   }
 
   _touch(dir) {
+    this.generation++;
     dir.mtime = dir.ctime = this.clock();
   }
 }

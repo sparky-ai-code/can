@@ -15,6 +15,7 @@ import { loadBuiltin, ALLOWED_BUILTINS, ASYNC_BUILTINS, builtinReady } from './m
 import { needsEsm, toCommonJs, staticSpecs, withDynamicImport } from './esm.js';
 import { Membrane, hardening } from '../vm/membrane.js';
 import { installStackFilter, hostFreeStack } from '../vm/stacks.js';
+import { makeConsole } from './console.js';
 
 /** Built-ins written in JavaScript that run inside the can's realm (JsRuntime.loadInternal). */
 const INTERNAL_BUILTINS = {
@@ -36,7 +37,9 @@ const WRAP_HEAD = '(function (exports, require, module, __filename, __dirname) {
 const ASYNC_WRAP_HEAD = '(async function (exports, require, module, __filename, __dirname) {';
 const WRAP_TAIL = '\n})';
 const NODE_PATH = '/usr/local/bin/node';
-const NODE_VERSION = 'v20.11.0';
+// The version the can reports. The can's JavaScript runs on the host's Node engine (24.x in the installers),
+// so report a version whose APIs match it. Sparky's server refuses node:sqlite below 22.16.
+const NODE_VERSION = 'v24.15.0';
 
 /** Thrown by process.exit() to unwind synchronous user code. Never reaches the host. */
 export class ProcessExit extends Error {
@@ -634,12 +637,8 @@ export class JsRuntime {
 
   _makeContext() {
     const rt = this;
-    const writer = (stream) => (...args) => { stream.write(`${format(...args)}\n`); };
     const globals = {
-      console: {
-        log: writer(this.stdout), info: writer(this.stdout), debug: writer(this.stdout),
-        error: writer(this.stderr), warn: writer(this.stderr),
-      },
+      console: makeConsole(this.stdout, this.stderr),
       process: this.process,
       Buffer,
       URL,

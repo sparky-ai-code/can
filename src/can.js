@@ -13,7 +13,7 @@ const isBytes = (v) => v instanceof Uint8Array;
  * a single-message snapshot would have been).
  */
 async function pullSnapshot(vm) {
-  const head = await vm.request('snapshotHead');
+  const { generation, ...head } = await vm.request('snapshotHead');
   let root = null;
   try {
     let from = 0;
@@ -25,7 +25,7 @@ async function pullSnapshot(vm) {
   } finally {
     await vm.request('snapshotEnd').catch(() => {});
   }
-  return { ...head, vfs: { ...head.vfs, root } };
+  return { snapshot: { ...head, vfs: { ...head.vfs, root } }, generation };
 }
 
 /** Sends a saved-form snapshot into a VM a page at a time, then restores it there. Returns the VM's meta. */
@@ -238,8 +238,21 @@ export class Can {
 
   // ---- state
 
-  snapshot() {
+  async snapshot() {
+    return (await pullSnapshot(this._vm)).snapshot;
+  }
+
+  /**
+   * The snapshot together with the generation it was taken at ({snapshot, generation}). A save records the generation
+   * so a later save can skip the write while nothing has changed (see CanManager.save).
+   */
+  snapshotTagged() {
     return pullSnapshot(this._vm);
+  }
+
+  /** The current generation of the can's saved state (see Machine.generation). One short message to the VM. */
+  generation() {
+    return this._vm.request('generation');
   }
 
   /** Replaces the can's filesystem and env. Processes are stopped and ports closed first. */

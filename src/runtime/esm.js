@@ -12,7 +12,9 @@
 
 // The clause may span lines (multi-line named imports) but never a quote or semicolon, so a bare `import "x";`
 // is not joined to the next statement's `from`.
-const IMPORT_RE = /^([ \t]*)import\s+(?:([^;'"]*?)\s+from\s+)?(['"])([^'"\n]+)\3(?:\s*(?:with|assert)\s*\{[^}]*\})?[ \t]*;?/gm;
+// The whitespace is optional where JavaScript allows none, and the statement may follow a `;` on the same line:
+// minified bundles write `...;import{a as b}from"./x.js";...`.
+const IMPORT_RE = /^([ \t]*)import(?:\s+|(?=[{*'"]))(?:([^;'"]*?)\s*from\s*)?(['"])([^'"\n]+)\3(?:\s*(?:with|assert)\s*\{[^}]*\})?[ \t]*;?/gm;
 const EXPORT_DECL_RE = /^([ \t]*)export\s+(const|let|var|async\s+function\*?|function\*?|class)\s+([A-Za-z_$][\w$]*)/gm;
 const EXPORT_PATTERN_RE = /^([ \t]*)export\s+(const|let|var)\s+(?=[\[{])/gm;
 const EXPORT_DEFAULT_NAMED_RE = /^([ \t]*)export\s+default\s+((?:async\s+)?function\*?|class)\s+([A-Za-z_$][\w$]*)/gm;
@@ -70,6 +72,12 @@ function lineOf(src, index) {
 
 function fail(file, src, index, what) {
   return new SyntaxError(`${file}:${lineOf(src, index)}: unsupported ES module syntax in this can: ${what}`);
+}
+
+// Minified bundles put several statements on one line (`...;import{a}from"./x.js";...`), so a statement can start
+// after a `;`. A caller that reads such code passes statementStarts: true to toCommonJs.
+function statementStart(re) {
+  return new RegExp(re.source.replace(/^\^/, '(?<=^|[;}\\n])'), re.flags);
 }
 
 /** Replaces matches of re in src, keeping every newline so line numbers do not move. */
@@ -190,6 +198,7 @@ function matchClose(src, start) {
  * each import with `require.async`. Throws SyntaxError for syntax it does not translate.
  */
 export function toCommonJs(src, file, opts = {}) {
+  const rx = (re) => (opts.statementStarts ? statementStart(re) : re);
   const isAsync = Boolean(opts.async);
   // The prelude reaches require and exports through __can_req and __can_exports, captured before the module's own
   // block, so an imported binding called `require` or `exports` cannot shadow them.
@@ -201,7 +210,7 @@ export function toCommonJs(src, file, opts = {}) {
   let n = 0;
   let body = src;
 
-  body = blankAll(body, IMPORT_RE, ([indent, clause, , spec], offset) => {
+  body = blankAll(body, rx(IMPORT_RE), ([indent, clause, , spec], offset) => {
     const { def, ns, named } = parseClause(clause, file, src, offset);
     const id = `__can_m${n++}`;
     prelude.push(`const ${id} = ${load(spec)};`);
@@ -213,7 +222,7 @@ export function toCommonJs(src, file, opts = {}) {
     return '';
   });
 
-  body = blankAll(body, EXPORT_LIST_RE, ([indent, list, , spec], offset) => {
+  body = blankAll(body, rx(EXPORT_LIST_RE), ([indent, list, , spec], offset) => {
     const items = stripComments(list).split(',').map((p) => p.trim()).filter(Boolean).map((p) => {
       const m = /^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/.exec(p);
       if (!m) throw fail(file, src, offset, `export specifier '${p}'`);
@@ -233,7 +242,7 @@ export function toCommonJs(src, file, opts = {}) {
     return '';
   });
 
-  body = blankAll(body, EXPORT_STAR_RE, ([, asName, , spec], offset) => {
+  body = blankAll(body, rx(EXPORT_STAR_RE), ([, asName, , spec], offset) => {
     const id = `__can_m${n++}`;
     prelude.push(`const ${id} = ${load(spec)};`);
     if (asName) {
@@ -244,7 +253,7 @@ export function toCommonJs(src, file, opts = {}) {
     return '';
   });
 
-  body = blankAll(body, EXPORT_DEFAULT_NAMED_RE, ([indent, kind, name], offset) => {
+  body = blankAll(body, rx(EXPORT_DEFAULT_NAMED_RE), ([indent, kind, name], offset) => {
     prelude.push(`Object.defineProperty(__can_exports,'default', { enumerable: true, get: () => ${name} });`);
     return `${indent}${kind.replace(/\s+/, ' ')} ${name}`;
   });
@@ -254,9 +263,9 @@ export function toCommonJs(src, file, opts = {}) {
   {
     let out = '';
     let last = 0;
-    EXPORT_PATTERN_RE.lastIndex = 0;
+    const patternRe = rx(EXPORT_PATTERN_RE); patternRe.lastIndex = 0;
     let m;
-    while ((m = EXPORT_PATTERN_RE.exec(body)) !== null) {
+    while ((m = patternRe.exec(body)) !== null) {
       const start = m.index + m[0].length;
       const end = matchClose(body, start);
       const names = patternNames(body.slice(start, end), file);
@@ -269,7 +278,7 @@ export function toCommonJs(src, file, opts = {}) {
     body = out + body.slice(last);
   }
 
-  body = blankAll(body, EXPORT_DECL_RE, ([indent, kind, name], offset) => {
+  body = blankAll(body, rx(EXPORT_DECL_RE), ([indent, kind, name], offset) => {
     prelude.push(`Object.defineProperty(__can_exports,${JSON.stringify(name)}, { enumerable: true, get: () => ${name} });`);
     return `${indent}${kind} ${name}`;
   });

@@ -46,6 +46,16 @@ export class Machine {
     this.policy = normalizePolicy(policy);
     this.vnet = new VNet();
     this.proc = new ProcessTable({ executor, can: this });
+    this._epoch = 0; // counts restores, which replace the filesystem, env, policy and name
+  }
+
+  /**
+   * A token that changes whenever the saved state (snapshotHead and the tree) may have changed: the filesystem, its
+   * cwd and mounts (VFS.generation), or a restore. Processes and ports are not part of the saved state, so they do not
+   * change it. Equal tokens mean the saved file already holds this state (see CanManager.save).
+   */
+  generation() {
+    return `${this._epoch}.${this.vfs.generation}`;
   }
 
   /** Starts a process. Returns its view. See ProcessTable.spawn. */
@@ -127,6 +137,7 @@ export class Machine {
   restore(snap) {
     checkSnapshot(snap);
     this._stopAll();
+    this._epoch++;
     this.name = snap.name ?? this.name;
     this.env = { ...snap.env };
     this.policy = normalizePolicy(snap.policy ?? {});

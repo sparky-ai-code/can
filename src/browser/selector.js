@@ -418,6 +418,16 @@ function parsePseudo(p) {
     case 'enabled': return (el) => FORM_CONTROLS.has(el.tagName) && !el.hasAttribute('disabled');
     case 'link':
     case 'any-link': return (el) => (el.tagName === 'a' || el.tagName === 'area') && el.hasAttribute('href');
+    // User-state pseudo-classes. The renderer has no pointer, keyboard focus or history state, so these never match:
+    // a page's hover or focus rules simply do not apply, as they do not for a page that has not been touched.
+    case 'hover':
+    case 'active':
+    case 'focus':
+    case 'focus-visible':
+    case 'focus-within':
+    case 'visited':
+    case 'target':
+      return () => false;
     default:
       throw err(p, `unsupported pseudo-class ":${name}"`);
   }

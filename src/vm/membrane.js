@@ -13,6 +13,12 @@ import { hostFreeStack } from './stacks.js';
 /** Set to false only by the VM worker when started with --no-layer2 (layer-1-only test mode). */
 export const hardening = { enabled: true };
 
+/**
+ * Host functions that may be handed to page code under the `constructor` key: each is inert (it throws when called), and
+ * a host component registers it here. Anything else under a blocked key is refused.
+ */
+export const inertConstructors = new WeakSet();
+
 /** Property names whose values lead to host intrinsics or accessors that reach them. */
 export const BLOCKED_KEYS = new Set([
   'constructor', '__proto__', 'caller', 'callee', 'arguments',
@@ -40,6 +46,8 @@ export class Membrane {
   /** @param {object} context the contextified object of the vm context this membrane serves */
   constructor(context) {
     this.SandboxError = vm.runInContext('Error', context);
+    // The sandbox realm's Function.prototype: a function whose chain reaches it is sandbox code (see sandbox()).
+    this.sbFunctionProto = vm.runInContext('Function.prototype', context);
     // instanceof for membrane functions. The host's own check would walk raw host prototypes and miss
     // the membrane proxies in a sandbox subclass's chain, so the walk runs in the sandbox realm.
     this.hasInstance = vm.runInContext(`(function (value) {
@@ -74,6 +82,9 @@ export class Membrane {
     if (!hardening.enabled || !isObj(v)) return v;
     if (this.unwrapOf.has(v)) return this.unwrapOf.get(v);
     if (this.proxyRaw.has(v) || this.native.has(v)) return v;
+    // A sandbox function is sandbox code already. Wrapping it as a host function would make each call unwrap its
+    // arguments to host objects, so the sandbox would see a socket or a response as host objects, not proxies.
+    if (typeof v === 'function' && this._isSandboxFunction(v)) return v;
     let p = this.toSb.get(v);
     if (!p) {
       p = typeof v === 'function' ? this._fnProxy(v) : this._objProxy(v);
@@ -81,6 +92,14 @@ export class Membrane {
       this.proxyRaw.set(p, v);
     }
     return p;
+  }
+
+  /** True for a function of the sandbox realm: its prototype chain reaches the sandbox's Function.prototype. */
+  _isSandboxFunction(fn) {
+    for (let o = Reflect.getPrototypeOf(fn); o !== null; o = Reflect.getPrototypeOf(o)) {
+      if (o === this.sbFunctionProto) return true;
+    }
+    return false;
   }
 
   /** Sandbox value -> the value host code sees. */
@@ -206,11 +225,23 @@ export class Membrane {
     const blockedGet = (key) => {
       let v;
       try { v = Reflect.get(raw, key); } catch { return undefined; }
+      // An inert constructor (registered by the browser for el.constructor) comes back behind the membrane, like any
+      // host function, so its own constructor and call paths stay blocked.
+      if (inertConstructors.has(v)) return m.sandbox(v);
       return m.native.has(v) ? v : undefined;
     };
     return {
       get: (_t, key) => (blocked(key) ? blockedGet(key) : m._guard(() => Reflect.get(raw, key))),
-      set: (_t, key, value) => (blocked(key) ? false : m._try(() => Reflect.set(raw, key, m.host(value)))),
+      // The receiver is the object the assignment was made on. This proxy is in its prototype chain when it is not this
+      // proxy's own object: a sandbox subclass of a host class has the host prototype's proxy in its instances' chain, and
+      // a sandbox object (Object.create of a host prototype) does too. The property then belongs to the receiver, as
+      // OrdinarySet makes it, and not to the host prototype that every instance shares (a ws server lost its 'connection'
+      // listeners when a WebSocket was built). A sandbox value stays sandbox-side when the receiver is sandbox-side.
+      set: (_t, key, value, receiver) => (blocked(key) ? false : m._try(() => {
+        if (m.proxyRaw.get(receiver) === raw) return Reflect.set(raw, key, m.host(value));
+        if (m.proxyRaw.has(receiver)) return Reflect.set(raw, key, m.host(value), receiver);
+        return Reflect.set(raw, key, value, receiver);
+      })),
       has: (_t, key) => (blocked(key) ? blockedGet(key) !== undefined : Reflect.has(raw, key)),
       deleteProperty: (_t, key) => m._try(() => Reflect.deleteProperty(raw, key)),
       ownKeys: () => Reflect.ownKeys(raw).filter((k) => !blocked(k)),

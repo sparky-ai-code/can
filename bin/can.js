@@ -6,25 +6,25 @@
 import fs from 'node:fs';
 import readline from 'node:readline';
 import { CanRegistry } from '../src/registry.js';
-import { startMcpServer } from '../src/mcp/server.js';
-import { defaultTransferRoot, exportFromCan, importToCan, writeTransferFile } from '../src/transfer.js';
 import { pngSize } from '../src/browser/png.js';
 import { listMounts, defaultMountsFile, chromiumBrowserEnabled } from '../src/mounts.js';
 import { describeReport } from '../src/environment.js';
-import { describeCi, normalizeCi, runCi } from '../src/ci.js';
 import { KernelError } from '../src/kernel/errors.js';
-import { ChromiumBrowsers } from '../src/canchromium.js';
 import {
   bundleDir, cacheDir, configFilePath, configuredSource, fetchTools, listTools, mirrorTools, parseSource,
   setConfiguredSource, verifyTools,
 } from '../src/toolchains.js';
 
+// The MCP server, the CI runner, the transfer code and the Chromium driver are imported by the command that needs them,
+// so a plain `can ls` loads none of them (see the commands below).
+
 /**
  * The browser a CLI command uses on one can: a real Chromium (the default), or the can's built-in browser when the
  * mounts file sets "chromiumBrowser": false. `close()` stops the browser and must run before the command ends.
  */
-function cliBrowser(reg, can) {
+async function cliBrowser(reg, can) {
   if (!chromiumBrowserEnabled(reg.manager.mountsFile)) return { b: can, close: async () => {} };
+  const { ChromiumBrowsers } = await import('../src/canchromium.js');
   const browsers = new ChromiumBrowsers();
   return { b: browsers.for(can), close: () => browsers.closeAll() };
 }
@@ -157,6 +157,7 @@ function canRef(arg) {
 
 /** cp, import and export. Import reads a host path into a can. Export writes a can path to the transfer root. */
 async function transfer(reg, rest, mode) {
+  const { defaultTransferRoot, exportFromCan, importToCan } = await import('../src/transfer.js');
   const overwrite = rest.includes('--overwrite');
   const args = rest.filter((a) => a !== '--overwrite');
   need(args, 2, 'source and destination');
@@ -308,6 +309,8 @@ const commands = {
       else throw new UsageError(`ci takes one pipeline file and optionally --json (got "${arg}")`);
     }
     if (file === null) throw new UsageError('ci takes a pipeline file, such as: can ci pipeline.json');
+    const { defaultTransferRoot } = await import('../src/transfer.js');
+    const { describeCi, normalizeCi, runCi } = await import('../src/ci.js');
     let spec;
     try {
       spec = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, ''));
@@ -439,7 +442,7 @@ const commands = {
   async browse(reg, rest) {
     need(rest, 2, 'url');
     const can = await reg.get(rest[0]);
-    const { b, close } = cliBrowser(reg, can);
+    const { b, close } = await cliBrowser(reg, can);
     try {
       const s = await b.browse('goto', rest[1]);
       const snapshot = await b.browse('snapshot');
@@ -452,7 +455,7 @@ const commands = {
   async screenshot(reg, rest) {
     const o = screenshotOptions(rest);
     const can = await reg.get(o.can);
-    const { b, close } = cliBrowser(reg, can);
+    const { b, close } = await cliBrowser(reg, can);
     let png;
     try {
       if (o.url !== undefined) await b.browse('goto', o.url);
@@ -460,6 +463,7 @@ const commands = {
     } finally {
       await close();
     }
+    const { defaultTransferRoot, writeTransferFile } = await import('../src/transfer.js');
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const file = writeTransferFile(png, o.out ?? `screenshot-${stamp}.png`, { root: defaultTransferRoot(), overwrite: o.overwrite });
     const { width, height } = pngSize(png);
@@ -511,6 +515,7 @@ const commands = {
   },
 
   async mcp(reg) {
+    const { startMcpServer } = await import('../src/mcp/server.js');
     await startMcpServer({ registry: reg });
   },
 

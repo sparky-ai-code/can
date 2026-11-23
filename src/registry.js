@@ -6,9 +6,9 @@ import path from 'node:path';
 import { CanManager, defaultStoreDir } from './manager.js';
 import { KernelError } from './kernel/errors.js';
 import { environmentKey, normalizeEnvironment } from './environment.js';
+import { dropEntry, scanStore } from './store-index.js';
 
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
-const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const STALE_AFTER_MS = 60 * 60 * 1000; // a leftover without a lock file is removed after this long
 
 /** Can names appear in `can:path` arguments and CLI output, so they are kept simple. */
@@ -101,38 +101,13 @@ export class CanRegistry {
   }
 
   /**
-   * Saved cans, read from their files (no VM starts): [{id, name, createdAt, specKey, tools, savedAt}].
+   * Saved cans, from the store's index, checked against the files (no VM starts, and a file is parsed only when the
+   * index has no current entry for it; see store-index.js): [{id, name, createdAt, specKey, tools, savedAt}].
    */
   saved() {
-    let files;
-    try {
-      files = fs.readdirSync(this.storeDir);
-    } catch (err) {
-      if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return []; // a store that is not a folder holds no cans
-      throw err;
-    }
-    const out = [];
-    for (const file of files) {
-      if (!file.endsWith('.json')) continue;
-      const id = file.slice(0, -'.json'.length);
-      if (!ID_PATTERN.test(id)) continue;
-      try {
-        const snap = JSON.parse(fs.readFileSync(path.join(this.storeDir, file), 'utf8'));
-        if (snap?.format === 'can-snapshot' && snap.id === id) {
-          out.push({
-            id,
-            name: snap.name,
-            createdAt: snap.createdAt,
-            specKey: snap.canMeta?.specKey ?? null,
-            tools: snap.canMeta?.tools ?? [],
-            savedAt: snap.canMeta?.savedAt ?? null,
-          });
-        }
-      } catch {
-        // unreadable or partial file: not a can this registry can use
-      }
-    }
-    return out.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    return scanStore(this.storeDir).map(({ id, name, createdAt, specKey, tools, savedAt }) => ({
+      id, name, createdAt, specKey, tools, savedAt,
+    }));
   }
 
   /** Every can the registry knows: live cans with their status, then saved cans that are not loaded. */
@@ -153,12 +128,13 @@ export class CanRegistry {
     if (live) return live;
     const entry = this._findSaved(ref);
     if (!entry) throw notFound(ref);
-    return this._loadOnce(entry.id);
+    return this._loadOnce(entry.id, entry);
   }
 
-  _loadOnce(id) {
+  /** Loads a saved can once, however many callers ask at the same time. `entry` may carry the file already parsed. */
+  _loadOnce(id, entry) {
     if (!this._loading.has(id)) {
-      this._loading.set(id, this.manager.load(id).finally(() => this._loading.delete(id)));
+      this._loading.set(id, this.manager.load(id, entry?.parsed).finally(() => this._loading.delete(id)));
     }
     return this._loading.get(id);
   }
@@ -242,14 +218,17 @@ export class CanRegistry {
       await this.manager.stop(current.id);
     }
     this._errors.delete(entry.id);
-    const can = await this._loadOnce(entry.id);
+    const can = await this._loadOnce(entry.id, live ? null : entry);
     return { can, was, savedAt: can.savedAt ?? null };
   }
 
-  /** Writes the can's state to disk. Returns the file path. */
-  async save(ref) {
+  /**
+   * Writes the can's state to disk. Returns the file path. Skipped when nothing changed (see CanManager.save), unless
+   * `force` is set.
+   */
+  async save(ref, opts) {
     const can = await this.get(ref);
-    return this.manager.save(can.id);
+    return this.manager.save(can.id, opts);
   }
 
   /** Records the last error a tool gave for a live can, so can_status can show it. */
@@ -278,6 +257,7 @@ export class CanRegistry {
       await this.manager.destroy(now.id);
     } else {
       fs.rmSync(path.join(this.storeDir, `${entry.id}.json`), { force: true });
+      dropEntry(this.storeDir, entry.id);
     }
     this._errors.delete(entry.id);
     return entry.name;
@@ -299,7 +279,10 @@ export class CanRegistry {
       if (this.manager.get(s.id)) continue; // loaded now, so it is in use
       const created = Number(s.createdAt);
       if (!Number.isFinite(created) || now - created < olderThanMs) continue;
-      if (!dryRun) fs.rmSync(path.join(this.storeDir, `${s.id}.json`), { force: true });
+      if (!dryRun) {
+        fs.rmSync(path.join(this.storeDir, `${s.id}.json`), { force: true });
+        dropEntry(this.storeDir, s.id);
+      }
       removed.push(s.name);
     }
     return removed;
@@ -331,8 +314,10 @@ export class CanRegistry {
     return result;
   }
 
+  /** The saved can with this id or name, or undefined. Its file is kept parsed for the load (see _loadOnce). */
   _findSaved(ref) {
-    return this.saved().find((s) => s.id === ref || s.name === ref);
+    const keep = (id, name) => id === ref || name === ref;
+    return scanStore(this.storeDir, { keep }).find((s) => s.id === ref || s.name === ref);
   }
 
   _autoName() {

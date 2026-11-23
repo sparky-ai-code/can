@@ -15,32 +15,24 @@ import { KernelError } from './kernel/errors.js';
 import { DEFAULT_ENV } from './vm/seed.js';
 import { resolveMounts, defaultMountsFile } from './mounts.js';
 import { normalizeEnvironment, applyEnvironment, environmentKey } from './environment.js';
+import { dropEntry, recordEntry, writeAtomic } from './store-index.js';
 
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
-export { DEFAULT_ENV };
+export { DEFAULT_ENV, writeAtomic };
 
 export function defaultStoreDir() {
   return path.join(os.homedir(), '.can', 'cans');
 }
 
-/**
- * Writes text to `file` atomically: a unique .tmp file is written next to it (with a .lock file naming this pid, so a
- * startup sweep can tell a live write from a leftover), then renamed over `file`. The .tmp and .lock are removed in
- * every case, so a failed write leaves nothing behind.
- */
-export function writeAtomic(file, text) {
-  const tmp = `${file}.${process.pid}-${randomUUID().slice(0, 8)}.tmp`;
-  const lock = `${tmp}.lock`;
+/** True when the file still has the size and mtime recorded at the last write or load. */
+function sameFileAs(file, mark) {
   try {
-    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
-    fs.writeFileSync(tmp, text);
-    fs.renameSync(tmp, file);
-  } finally {
-    fs.rmSync(tmp, { force: true });
-    fs.rmSync(lock, { force: true });
+    const st = fs.statSync(file);
+    return st.size === mark.size && st.mtimeMs === mark.mtimeMs;
+  } catch {
+    return false;
   }
-  return file;
 }
 
 export class CanManager {
@@ -108,37 +100,51 @@ export class CanManager {
     this.cans.delete(can.id);
     await can.destroy();
     fs.rmSync(this._file(can.id), { force: true });
+    dropEntry(this.storeDir, can.id);
   }
 
   /**
    * Writes the can's snapshot to <storeDir>/<id>.json (atomically, see writeAtomic). Returns the file path. The
    * can's savedAt is set to the time of the write.
+   *
+   * A save is skipped when nothing has changed since the last write or load: the VM reports the same generation
+   * (see Machine.generation) and the file still has the size and mtime that were written. `force` (can_save) always
+   * writes. A skipped save keeps the old savedAt.
    */
-  async save(idOrName) {
+  async save(idOrName, { force = false } = {}) {
     const can = this._require(idOrName);
-    const snap = await can.snapshot();
     const file = this._file(can.id);
+    const mark = can.savedMark;
+    if (!force && mark && (await can.generation()) === mark.generation && sameFileAs(file, mark)) return file;
+    const { snapshot: snap, generation } = await can.snapshotTagged();
     fs.mkdirSync(this.storeDir, { recursive: true });
     const savedAt = new Date().toISOString();
-    const doc = {
-      ...snap,
-      canMeta: { specKey: can.specKey ?? null, tools: can.toolchains ?? [], savedAt },
-    };
-    writeAtomic(file, JSON.stringify(doc));
+    const canMeta = { specKey: can.specKey ?? null, tools: can.toolchains ?? [], savedAt };
+    writeAtomic(file, JSON.stringify({ ...snap, canMeta }));
+    const stat = fs.statSync(file);
     can.savedAt = savedAt;
+    can.savedMark = { generation, size: stat.size, mtimeMs: stat.mtimeMs };
+    recordEntry(this.storeDir, can.id, { name: snap.name, createdAt: snap.createdAt, ...canMeta }, stat);
     return file;
   }
 
-  /** Starts a saved can in a new VM. If that id is already live, returns the live instance. */
-  async load(id) {
+  /**
+   * Starts a saved can in a new VM. If that id is already live, returns the live instance. `pre` may carry the file
+   * the registry has already parsed, as {doc, stat} (see store-index.js scanStore); then the file is not read again.
+   */
+  async load(id, pre = {}) {
     const file = this._file(id);
     if (this.cans.has(id)) return this.cans.get(id);
-    let doc;
-    try {
-      doc = JSON.parse(fs.readFileSync(file, 'utf8'));
-    } catch (err) {
-      if (err.code === 'ENOENT') throw new KernelError('ENOENT', `ENOENT: no saved can "${id}". Next: call can_list to see the cans.`, { path: file });
-      throw err;
+    let doc = pre.doc;
+    let stat = pre.stat;
+    if (!doc) {
+      try {
+        stat = fs.statSync(file); // before the read: see scanStore
+        doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+      } catch (err) {
+        if (err.code === 'ENOENT') throw new KernelError('ENOENT', `ENOENT: no saved can "${id}". Next: call can_list to see the cans.`, { path: file });
+        throw err;
+      }
     }
     const { canMeta, ...snap } = doc ?? {};
     if (snap?.id !== id) throw new KernelError('EINVAL', `EINVAL: saved file ${id}.json holds can ${snap?.id}`);
@@ -149,6 +155,13 @@ export class CanManager {
       can.specKey = canMeta?.specKey ?? null;
       can.toolchains = canMeta?.tools ?? [];
       can.savedAt = canMeta?.savedAt ?? null;
+      // The loaded state is the file's state, so the next save with no change can be skipped.
+      try {
+        can.savedMark = { generation: await can.generation(), size: stat.size, mtimeMs: stat.mtimeMs };
+      } catch (err) {
+        await can.destroy().catch(() => {});
+        throw err;
+      }
       this.cans.set(can.id, can);
       return can;
     } finally {
@@ -187,7 +200,8 @@ export class CanManager {
   }
 
   _file(id) {
-    if (typeof id !== 'string' || !ID_PATTERN.test(id)) throw new KernelError('EINVAL', `EINVAL: invalid can id ${id}`);
+    // "index" is the store's own file name (store-index.js), so no can may use it as an id.
+    if (typeof id !== 'string' || !ID_PATTERN.test(id) || id === 'index') throw new KernelError('EINVAL', `EINVAL: invalid can id ${id}`);
     return path.join(this.storeDir, `${id}.json`);
   }
 
