@@ -49,3 +49,19 @@ cost target in the design (section 4) is not met yet. Lazy memory allocation and
 - Balloon behaviour: how much host memory is returned after the guest frees memory.
 - Guest `free` against the host working set over time.
 - Networking, disk overlays, and anything beyond the serial command loop.
+
+## Agent step: canit as PID 1
+
+The second step runs the real agent from `distro/canit/canit.c` as PID 1 in the guest, on the `can.agent` port, and
+drives it with `src/vm/guest-protocol.js` (the same framing the tests check).
+
+- Build the guest: `sh build-initramfs-canit.sh <repo folder> <this spike folder>` in WSL.
+- Run it: `node canit-client.mjs` from Windows.
+
+Measured on the same host and guest: the agent answers HELLO (canit 0.1, x86_64); `uname -r` and `echo` run as exec
+requests and return their exit codes and output; POWEROFF is acknowledged with 0xa0; QEMU exits 0 about 4.6 s after
+the client starts. `test/guest-protocol.test.js` and `test/canit.test.js` (which builds and runs `canit` in WSL)
+both pass.
+
+The agent handles one request at a time, as its header says. Concurrent exec, spawn, files and ports are the next
+step of the backend.
