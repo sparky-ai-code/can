@@ -7,7 +7,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  FrameDecoder, T, decodeExecResult, decodeHello, encodeExec, encodeFrame, OUTPUT_CAP,
+  FrameDecoder, T, decodeExecResult, decodeHello, encodeExec, encodeFrame, encodeRead, encodeWrite, OUTPUT_CAP,
 } from '../src/vm/guest-protocol.js';
 
 const SOURCE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'distro', 'canit', 'canit.c');
@@ -155,4 +155,46 @@ test('poweroff replies, then the agent exits', { skip }, async () => {
 test('the agent exits when the host closes the channel', { skip }, async () => {
   const a = new Agent();
   assert.equal(await a.close(), 0);
+});
+
+test('write creates a file with the mode asked for, and read returns its bytes', { skip }, async () => {
+  const dir = `/tmp/canit-files-${process.pid}`;
+  const agent = new Agent();
+  try {
+    assert.equal((await agent.exec(['/bin/mkdir', '-p', dir])).exitCode, 0);
+    const bytes = Buffer.from([0, 1, 2, 255, 10, 13, 0]); // binary, with NULs and newlines
+    const wrote = await agent.request(T.WRITE, encodeWrite({ path: `${dir}/blob.bin`, data: bytes, mode: 0o600 }));
+    assert.equal(wrote.type, T.WRITE | T.REPLY, `write reply was ${wrote.type}: ${wrote.payload}`);
+    const read = await agent.request(T.READ, encodeRead(`${dir}/blob.bin`));
+    assert.equal(read.type, T.READ | T.REPLY, `read reply was ${read.type}: ${read.payload}`);
+    assert.deepEqual(read.payload, bytes, 'the bytes come back exactly');
+    const stat = await agent.exec(['/bin/sh', '-c', `stat -c %a ${dir}/blob.bin`]);
+    assert.equal(stat.stdout.trim(), '600', 'the mode asked for is set');
+  } finally {
+    await agent.request(T.EXEC, encodeExec({ argv: ['/bin/rm', '-rf', dir] }));
+    await agent.close();
+  }
+});
+
+test('write replaces an existing file; read refuses a folder and a missing file with an ERROR', { skip }, async () => {
+  const dir = `/tmp/canit-replace-${process.pid}`;
+  const agent = new Agent();
+  try {
+    await agent.exec(['/bin/mkdir', '-p', dir]);
+    await agent.request(T.WRITE, encodeWrite({ path: `${dir}/f`, data: 'a much longer first version' }));
+    await agent.request(T.WRITE, encodeWrite({ path: `${dir}/f`, data: 'short' }));
+    const read = await agent.request(T.READ, encodeRead(`${dir}/f`));
+    assert.equal(read.payload.toString(), 'short', 'the second write truncated the file');
+    const folder = await agent.request(T.READ, encodeRead(dir));
+    assert.equal(folder.type, T.ERROR);
+    assert.match(folder.payload.toString(), /is a folder/);
+    const missing = await agent.request(T.READ, encodeRead(`${dir}/nope`));
+    assert.equal(missing.type, T.ERROR);
+    assert.match(missing.payload.toString(), /No such file/);
+    const badWrite = await agent.request(T.WRITE, encodeWrite({ path: `${dir}/no-such-folder/x`, data: 'x' }));
+    assert.equal(badWrite.type, T.ERROR);
+  } finally {
+    await agent.request(T.EXEC, encodeExec({ argv: ['/bin/rm', '-rf', dir] }));
+    await agent.close();
+  }
 });

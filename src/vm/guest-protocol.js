@@ -10,6 +10,8 @@
 //   EXEC   0x10  payload: u32le timeoutMs (0 = none) | cwd\0 | argv0\0 argv1\0 ...    cwd "" = the agent's default
 //          reply 0x90: i32le exitCode (128 + n for signal n) | u8 timedOut | u32le outLen | u32le errLen | out | err
 //   POWEROFF 0x20  the agent syncs, replies 0xa0, then powers the machine off
+//   WRITE  0x30  payload: u32le mode | path\0 | data. Creates or replaces the file (its folder must exist). reply 0xb0, empty
+//   READ   0x31  payload: path\0. reply 0xb1 carries the file's bytes. A folder or a file over one frame is an error
 //   ERROR  0xff  payload: message text
 //
 // Limits: a frame is at most MAX_FRAME bytes; captured output per stream is capped by the agent (OUTPUT_CAP).
@@ -18,6 +20,8 @@ export const T = Object.freeze({
   PING: 0x02,
   EXEC: 0x10,
   POWEROFF: 0x20,
+  WRITE: 0x30,
+  READ: 0x31,
   REPLY: 0x80,
   ERROR: 0xff,
 });
@@ -81,6 +85,18 @@ export function encodeExec({ cwd = '', argv, timeoutMs = 0 }) {
   const head = Buffer.alloc(4);
   head.writeUInt32LE(timeoutMs, 0);
   return Buffer.concat([head, cstr(cwd, 'cwd'), ...argv.map((a, i) => cstr(a, `argv[${i}]`))]);
+}
+
+/** A WRITE request: creates or replaces the file at path with data. mode is the file's permission bits. */
+export function encodeWrite({ path, data, mode = 0o644 }) {
+  const head = Buffer.alloc(4);
+  head.writeUInt32LE(mode & 0o7777, 0);
+  return Buffer.concat([head, cstr(path, 'path'), Buffer.from(data)]);
+}
+
+/** A READ request: the payload is the path. The reply payload is the file's bytes. */
+export function encodeRead(path) {
+  return cstr(path, 'path');
 }
 
 /** Reads an EXEC reply payload. */
