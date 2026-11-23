@@ -181,6 +181,8 @@ async function runStep(can, step, workdir) {
  * ok is false when a job that does not allow failure fails, when an artifact cannot be exported, or when the
  * environment cannot be set up (then `error` says why and no can exists).
  */
+const KEPT_CAN_RETENTION_MS = 24 * 3_600_000;
+
 export async function runCi(registry, rawSpec, { transferRoot, canName } = {}) {
   const ci = normalizeCi(rawSpec);
   const started = Date.now();
@@ -188,6 +190,15 @@ export async function runCi(registry, rawSpec, { transferRoot, canName } = {}) {
   const report = {
     ok: false, name: ci.name, canName: name, kept: false, seconds: 0, jobs: [], artifacts: [],
   };
+
+  // Cans kept from failed runs are removed once they are a day old, so they do not pile up without `can prune`.
+  // Best effort: a prune error never fails the run.
+  try {
+    const pruned = registry.prune({ prefix: 'ci-', olderThanMs: KEPT_CAN_RETENTION_MS });
+    if (pruned.length) report.pruned = pruned;
+  } catch {
+    // Nothing to prune, or the store could not be read. The run goes on.
+  }
 
   let can;
   try {
