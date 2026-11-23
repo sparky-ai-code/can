@@ -1,0 +1,152 @@
+name: Bench
+
+# Runs the start-up and exec benchmarks for Docker, runc, crun and can-lite on Linux, Windows and macOS, then merges
+# the result files into one comparison table. Manual runs take an iteration count; pull requests that touch the bench
+# harness or the runtime source run with the default count.
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'Measured runs for start-true (exec-echo, idle-mem and parallel-start-10 keep the README counts)'
+        type: number
+        default: 30
+  push:
+    branches: ['bench/**']
+  pull_request:
+    paths:
+      - 'bench/**'
+      - 'src/**'
+      - '.github/workflows/bench.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  containers:
+    name: Containers and can-lite (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install runc, crun and pull busybox
+        run: sh bench/ci/setup-runtimes.sh
+
+      - name: Report whether /dev/kvm exists
+        shell: bash
+        run: |
+          if [ -e /dev/kvm ]; then echo "/dev/kvm: present"; else echo "/dev/kvm: absent"; fi
+
+      - name: Create the output folder
+        shell: bash
+        run: mkdir -p bench/out
+
+      - name: Container benchmarks (root, for runc and crun)
+        shell: bash
+        run: |
+          sudo -E env "PATH=$PATH" node bench/containers.mjs --out bench/out/containers.json --iterations ${{ inputs.iterations || 30 }}
+          sudo chown -R "$(id -u):$(id -g)" bench/out
+
+      - name: can-lite benchmark
+        shell: bash
+        run: node bench/can-lite.mjs --out bench/out/can-lite-linux.json
+
+      - name: Comparison table
+        shell: bash
+        run: |
+          node bench/compare.mjs bench/out/*.json | tee bench/out/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the Linux results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-linux
+          path: bench/out
+          if-no-files-found: error
+
+  can-lite-windows:
+    name: can-lite (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: can-lite benchmark
+        shell: bash
+        run: |
+          mkdir -p bench/out
+          node bench/can-lite.mjs --out bench/out/can-lite-windows.json
+
+      - name: Comparison table
+        shell: bash
+        run: |
+          node bench/compare.mjs bench/out/*.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the Windows results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-windows
+          path: bench/out
+          if-no-files-found: error
+
+  can-lite-macos:
+    name: can-lite (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: can-lite benchmark
+        shell: bash
+        run: |
+          mkdir -p bench/out
+          node bench/can-lite.mjs --out bench/out/can-lite-macos.json
+
+      - name: Comparison table
+        shell: bash
+        run: |
+          node bench/compare.mjs bench/out/*.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the macOS results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-macos
+          path: bench/out
+          if-no-files-found: error
+
+  summary:
+    name: Combined comparison
+    needs: [containers, can-lite-windows, can-lite-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Download every result folder
+        uses: actions/download-artifact@v4
+        with:
+          path: bench/all
+          merge-multiple: true
+
+      - name: Comparison table over all results
+        shell: bash
+        run: |
+          node bench/compare.mjs bench/all/*.json | tee bench/all/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the combined results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-all
+          path: bench/all
+          if-no-files-found: error
