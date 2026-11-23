@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Smoke test for an installed copy of Can. CI runs it after each installer is installed, and you can run it by hand.
 //
-//   node packaging/smoke-test.mjs --can <can command> --can-mcp <can-mcp command> --node <node> --setup <agent-setup.js>
+//   node packaging/smoke.mjs --can <can command> --can-mcp <can-mcp command> --node <node> --setup <agent-setup.js>
 //
 // It checks: the CLI runs a can (create, exec, rm); the MCP server answers initialize and lists the can tools over
 // stdio; and agent-setup.js reports the skill and the Claude Code entry in place. Exits 0 when every check passes.

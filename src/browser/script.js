@@ -6,7 +6,7 @@
 import vm from 'node:vm';
 import { parseHTML } from './html.js';
 import { normalizeText, querySelector, querySelectorAll, matches } from './selector.js';
-import { Membrane, hardening } from '../vm/membrane.js';
+import { Membrane, hardening, inertConstructors } from '../vm/membrane.js';
 import { installStackFilter } from '../vm/stacks.js';
 import { installWebApis, rectObject, DOM_TAGS, domClassName, canvasContext } from './webapis.js';
 import { layoutPage } from './render.js';
@@ -240,7 +240,18 @@ function unwrap(w) {
  */
 function makeProtos(root) {
   const protos = new Map();
-  const make = (name, parent) => { const p = Object.create(parent); protos.set(name, p); return p; };
+  // Each prototype has a constructor that is its DOM class, so el.constructor.prototype is the element's prototype, as in a
+  // browser. Page code (React's property setters) reads that path; a wrapper without it throws.
+  const make = (name, parent) => {
+    const p = Object.create(parent);
+    const ctor = function () { throw new TypeError('Illegal constructor'); };
+    Object.defineProperty(ctor, 'name', { value: name });
+    ctor.prototype = p;
+    inertConstructors.add(ctor);
+    Object.defineProperty(p, 'constructor', { value: ctor, writable: true, configurable: true });
+    protos.set(name, p);
+    return p;
+  };
   const node = make('Node', root);
   const element = make('Element', node);
   const htmlElement = make('HTMLElement', element);
@@ -374,7 +385,13 @@ function makeWrapperClass() {
     get parentNode() { return this[HOST].wrap(this[NODE].parentNode); }
     get parentElement() { return this[HOST].wrap(this[NODE].parentElement); }
     get childNodes() { return this[NODE].childNodes.map((c) => this[HOST].wrap(c)); }
-    get children() { return this[NODE].children?.map((c) => this[HOST].wrap(c)) ?? []; }
+    // An HTMLCollection in the browser: an array with item() and namedItem(), so `children.item(i)` works.
+    get children() {
+      const list = this[NODE].children?.map((c) => this[HOST].wrap(c)) ?? [];
+      list.item = (index) => list[index] ?? null;
+      list.namedItem = (name) => list.find((el) => el.id === name || el.getAttribute?.('name') === name) ?? null;
+      return list;
+    }
     get firstChild() { return this[HOST].wrap(this[NODE].firstChild); }
     get lastChild() { return this[HOST].wrap(this[NODE].lastChild); }
     get firstElementChild() { return this[HOST].wrap(this[NODE].children?.[0] ?? null); }
@@ -618,6 +635,15 @@ function makeWrapperClass() {
       return null;
     }
     createElement(tag) { return this[HOST].wrap(this[HOST].doc.createElement(tag)); }
+    // Web Animations: this renderer draws a page's final state and runs no animations. A page that waits on one gets a
+    // finished animation, so its code continues as if the animation had ended.
+    getAnimations() { return []; }
+    animate() {
+      const done = Promise.resolve();
+      return { finished: done, ready: done, playState: 'finished', onfinish: null, oncancel: null, cancel() {}, finish() {}, play() {}, pause() {}, reverse() {}, addEventListener() {}, removeEventListener() {} };
+    }
+    // Namespaces are not kept: an SVG or MathML element is created by its name, so it is drawn as an element.
+    createElementNS(namespace, qualifiedName) { return this.createElement(String(qualifiedName).replace(/^[^:]*:/, '')); }
     createTextNode(text) { return this[HOST].wrap(this[HOST].doc.createTextNode(text)); }
     createComment(text) { return this[HOST].wrap(this[HOST].doc.createComment(text)); }
 

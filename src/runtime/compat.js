@@ -17,6 +17,7 @@ import nodeDiagnostics from 'node:diagnostics_channel';
 import nodeAssertStrict from 'node:assert/strict';
 import nodeStreamPromises from 'node:stream/promises';
 import nodeStreamWeb from 'node:stream/web';
+import { makeConsole } from './console.js';
 
 /** `readline`: interfaces read the program's stdin. Output and cursor control are not drawn anywhere. */
 function makeReadline(rt) {
@@ -43,16 +44,9 @@ function makeTimersPromises(rt) {
   };
 }
 
-/** `console`: the program's own console, as a module. */
-function makeConsole(rt) {
-  const write = (stream) => (...args) => { stream.write(`${format(...args)}\n`); };
-  return {
-    log: write(rt.stdout),
-    info: write(rt.stdout),
-    debug: write(rt.stdout),
-    error: write(rt.stderr),
-    warn: write(rt.stderr),
-  };
+/** `console`: the program's own console, as a module (the same object as the global). */
+function consoleModule(rt) {
+  return makeConsole(rt.stdout, rt.stderr);
 }
 
 /** `tty`: no program has a terminal here. */
@@ -101,7 +95,7 @@ export const COMPAT_FACTORIES = {
   'util/types': () => utilTypes,
   readline: (rt) => makeReadline(rt),
   'timers/promises': (rt) => makeTimersPromises(rt),
-  console: (rt) => makeConsole(rt),
+  console: (rt) => consoleModule(rt),
   tty: () => makeTty(),
   tls: () => makeTls(),
 };

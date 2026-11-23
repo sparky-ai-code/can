@@ -12,7 +12,7 @@ import { TEXT_BUILTINS, splitFlags } from './textcmds.js';
 import { UTIL_BUILTINS } from './utilcmds.js';
 import { SHELL_BUILTINS } from './shellcmds.js';
 import { STATUS_CODES } from './http.js';
-import { planTree, materialize, registryName } from './npm.js';
+import { planTree, materialize, registryName, loadWorkspace } from './npm.js';
 import { runPip, DEFAULT_INDEX, SITE_PACKAGES } from './pip.js';
 import { runWasm, runPython } from './wasi/run.js';
 import { KernelError } from '../kernel/errors.js';
@@ -448,12 +448,23 @@ const INSTALL_FLAGS = new Set([
 
 /** Parses install-style arguments into options and package specs. Unknown flags are refused. */
 function parseInstallArgs(args, io) {
-  const opts = { packages: [], dev: false, save: true, omitDev: false, ciMode: false };
-  for (const a of args) {
-    if (!a.startsWith('-')) opts.packages.push(a);
+  const opts = { packages: [], dev: false, save: true, omitDev: false, ciMode: false, omit: [] };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    // --omit <name> or --omit=<name>, repeatable. "dev" keeps its old meaning (devDependencies left out).
+    if (a === '--omit' || a.startsWith('--omit=')) {
+      const value = a === '--omit' ? args[++i] : a.slice('--omit='.length);
+      if (!value || value.startsWith('-')) {
+        errOut(io, 'npm ERR! --omit needs a package name');
+        return null;
+      }
+      if (value === 'dev') opts.omitDev = true;
+      else opts.omit.push(value);
+    }
+    else if (!a.startsWith('-')) opts.packages.push(a);
     else if (a === '--save-dev' || a === '-D') opts.dev = true;
     else if (a === '--no-save') opts.save = false;
-    else if (a === '--omit=dev' || a === '--production') opts.omitDev = true;
+    else if (a === '--production') opts.omitDev = true;
     else if (!INSTALL_FLAGS.has(a)) {
       errOut(io, `npm ERR! unknown option: ${a}`);
       return null;
@@ -467,7 +478,7 @@ function parseInstallArgs(args, io) {
  * policy, writes node_modules under the project folder and keeps package.json in step (named packages are saved
  * as ^version unless --no-save). Lifecycle scripts do not run; the warnings say which packages had them.
  */
-async function projectInstall(sh, io, { packages, dev, save, omitDev, ciMode }) {
+async function projectInstall(sh, io, { packages, dev, save, omitDev, ciMode, omit = [] }) {
   const dir = sh.cwd;
   const v = sh.can.vfs;
   const manifestPath = posix.join(dir, 'package.json');
@@ -489,8 +500,18 @@ async function projectInstall(sh, io, { packages, dev, save, omitDev, ciMode }) 
     }
   }
   const registry = sh.can.policy.registry;
+  // The pnpm workspace around this folder (catalogs, overrides, sibling packages). Overrides of the project's
+  // package.json are read here too; the planner applies them everywhere in the tree.
+  const workspace = loadWorkspace(v, dir, pkg);
+  const notes = [...workspace.warnings];
+  const wsRoot = workspace.workspaceFile ? posix.dirname(workspace.workspaceFile) : null;
+  if (!v.exists(posix.join(dir, 'package-lock.json')) && [dir, wsRoot].some((d) => d && v.exists(posix.join(d, 'pnpm-lock.yaml')))) {
+    notes.push('pnpm-lock.yaml is not read: versions come from the ranges in package.json, so they may differ from the lock');
+  }
   const planned = await planTree({
     roots,
+    workspace,
+    omit,
     getPackument: async (name) => {
       const body = await registryFetch(sh, `${registry}${registryName(name)}`, 'application/vnd.npm.install-v1+json, application/json;q=0.8');
       return body ? JSON.parse(body.toString('utf8')) : null;
@@ -501,12 +522,13 @@ async function projectInstall(sh, io, { packages, dev, save, omitDev, ciMode }) 
     vfs: v,
     cwd: dir,
     getTarball: (url) => registryFetch(sh, url, undefined),
-    warnings: [...planned.warnings],
+    warnings: [...planned.warnings, ...notes],
   });
   const writeManifest = save && !ciMode && (named.length > 0 || !pkg);
   if (writeManifest) {
     for (const n of named) {
       const entry = planned.placed.get(`node_modules/${n.name}`);
+      if (!entry) continue; // left out by --omit
       const field = dev ? 'devDependencies' : 'dependencies';
       const other = dev ? 'dependencies' : 'devDependencies';
       manifest[field] = { ...(manifest[field] ?? {}), [n.name]: `^${entry.version}` };
@@ -535,7 +557,8 @@ function* npm(args, io, sh) {
     if (cmd === 'ci') {
       if (opts.packages.length) { errOut(io, 'npm ERR! `npm ci` takes no package names'); return 1; }
       opts.save = false;
-      opts.ciMode = true;
+      // npm ci's rules apply only to an npm lockfile; a pnpm-lock.yaml is not read (see projectInstall).
+      opts.ciMode = v.exists(posix.join(sh.cwd, 'package-lock.json')) || v.exists(posix.join(sh.cwd, 'npm-shrinkwrap.json'));
     }
     try {
       return yield projectInstall(sh, io, opts);
@@ -594,7 +617,7 @@ function* pnpm(args, io, sh) {
     return 1;
   }
   if (sh.can.vfs.exists(posix.join(sh.cwd, 'pnpm-workspace.yaml'))) {
-    io.stderr.write('pnpm WARN pnpm-workspace.yaml found: only this folder\'s package.json is installed\n');
+    io.stderr.write('pnpm WARN pnpm-workspace.yaml found: its catalog, catalogs, overrides and packages are used; pnpm-lock.yaml is not\n');
   }
   if (!cmd || cmd === 'help') {
     io.stdout.write('Usage: pnpm install | pnpm add <pkg> | pnpm remove <pkg> | pnpm run <script> | pnpm test | pnpm start\n');

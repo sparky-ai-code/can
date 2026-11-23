@@ -514,7 +514,7 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
       ['can'],
       async (a) => {
         const can = await registry.get(a.can);
-        const file = await registry.manager.save(can.id);
+        const file = await registry.manager.save(can.id, { force: true });
         return `saved can "${can.name}" to ${file}`;
       },
     ),

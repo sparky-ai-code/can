@@ -60,13 +60,147 @@ function makeModuleBuiltin(rt) {
 
 const optsOf = (o) => (typeof o === 'string' ? { encoding: o } : (o ?? {}));
 
+const FS_OPEN_CONSTANTS = { O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2, O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024 };
+
+/** Reads an open-flags value: a node string ('r', 'r+', 'w', 'wx', 'a+', ...) or a numeric O_* mask. */
+function parseOpenFlags(flags) {
+  if (typeof flags === 'number') {
+    const access = flags & 3;
+    return {
+      read: access !== 1, write: access !== 0, create: (flags & 64) !== 0,
+      excl: (flags & 128) !== 0, trunc: (flags & 512) !== 0, append: (flags & 1024) !== 0,
+    };
+  }
+  const text = String(flags ?? 'r');
+  const norm = text.replace(/s/g, '');
+  const excl = norm.includes('x');
+  const core = norm.replace(/x/g, '');
+  const mode = core[0];
+  const plus = core.endsWith('+') && core.length === 2;
+  if (!['r', 'w', 'a'].includes(mode) || core.length > 2 || (core.length === 2 && !plus)) {
+    throw Object.assign(new TypeError(`The argument 'flags' is invalid: '${text}'`), { code: 'ERR_INVALID_ARG_VALUE' });
+  }
+  return {
+    read: mode === 'r' || plus,
+    write: mode !== 'r' || plus,
+    create: mode !== 'r',
+    excl,
+    trunc: mode === 'w',
+    append: mode === 'a',
+  };
+}
+
 function makeFs(rt) {
   const v = rt.vfs;
   const abs = (p) => {
     if (typeof p !== 'string') throw Object.assign(new TypeError('The "path" argument must be of type string'), { code: 'ERR_INVALID_ARG_TYPE' });
     return v.resolve(p, rt.cwd);
   };
+
+  // File descriptors: a program opens a file, then reads or writes it by position. Each descriptor keeps its path,
+  // its flags and its position. The bytes live in the VFS, so each read sees the latest write. The table belongs to
+  // the runtime, so fs and fs/promises share it. Descriptors start at 3, as node's do after stdio.
+  const table = rt.fdTable ??= { entries: new Map(), next: 3 };
+  const fdError = (code, message) => Object.assign(new Error(`${code}: ${message}`), { code });
+  const entryOf = (fd) => {
+    const e = table.entries.get(Number(fd));
+    if (!e) throw fdError('EBADF', `bad file descriptor, ${fd}`);
+    return e;
+  };
+  const openSync = (p, flags = 'r', mode) => {
+    const file = abs(p);
+    const o = parseOpenFlags(flags);
+    const existed = v.exists(file);
+    if (existed && o.create && o.excl) throw fdError('EEXIST', `file already exists, open '${p}'`);
+    if (!existed) {
+      if (!o.create) v.stat(file); // throws ENOENT
+      v.writeFile(file, Buffer.alloc(0), { mode: typeof mode === 'number' ? mode : undefined });
+    } else if (o.trunc) {
+      v.writeFile(file, Buffer.alloc(0));
+    }
+    if (o.write && v.stat(file).isDirectory()) throw fdError('EISDIR', `illegal operation on a directory, open '${p}'`);
+    const fd = table.next++;
+    table.entries.set(fd, { file, read: o.read, write: o.write, append: o.append, position: 0 });
+    return fd;
+  };
+  const readSync = (fd, buffer, offset = 0, length, position) => {
+    if (offset && typeof offset === 'object') ({ offset = 0, length, position } = offset);
+    const e = entryOf(fd);
+    if (!e.read) throw fdError('EBADF', `bad file descriptor, read ${fd}`);
+    const data = v.readFile(e.file);
+    const explicit = typeof position === 'number' || typeof position === 'bigint';
+    const start = explicit ? Number(position) : e.position;
+    const room = buffer.byteLength - offset;
+    const n = Math.max(0, Math.min(length ?? room, room, data.length - start));
+    if (n > 0) data.copy(Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength), offset, start, start + n);
+    if (!explicit) e.position = start + n;
+    return n;
+  };
+  const writeSync = (fd, data, a, b, c) => {
+    const e = entryOf(fd);
+    if (!e.write) throw fdError('EBADF', `bad file descriptor, write ${fd}`);
+    let chunk;
+    let position;
+    if (typeof data === 'string') {
+      chunk = Buffer.from(data, typeof b === 'string' ? b : 'utf8');
+      position = typeof a === 'number' ? a : null;
+    } else {
+      const off = typeof a === 'number' ? a : 0;
+      const len = typeof b === 'number' ? b : data.byteLength - off;
+      chunk = Buffer.from(data.buffer, data.byteOffset + off, len);
+      position = typeof c === 'number' ? c : null;
+    }
+    const current = v.readFile(e.file);
+    const start = e.append ? current.length : (position ?? e.position);
+    const end = Math.max(current.length, start + chunk.length);
+    const out = Buffer.alloc(end);
+    current.copy(out, 0, 0, current.length);
+    chunk.copy(out, start);
+    v.writeFile(e.file, out);
+    if (e.append || position === null) e.position = end;
+    return chunk.length;
+  };
+  const ftruncateSync = (fd, len = 0) => {
+    const e = entryOf(fd);
+    const current = v.readFile(e.file);
+    const out = Buffer.alloc(len);
+    current.copy(out, 0, 0, Math.min(len, current.length));
+    v.writeFile(e.file, out);
+  };
+
+  const truncateSync = (p, len = 0) => {
+    const file = abs(p);
+    const current = v.readFile(file);
+    const out = Buffer.alloc(len);
+    current.copy(out, 0, 0, Math.min(len, current.length));
+    v.writeFile(file, out);
+  };
+
   const sync = {
+    openSync,
+    readSync,
+    writeSync,
+    ftruncateSync,
+    truncateSync,
+    // Node's mkdtemp: the prefix plus six random characters, created as a directory (the parent must exist).
+    mkdtempSync: (prefix) => {
+      if (typeof prefix !== 'string') throw Object.assign(new TypeError('The "prefix" argument must be of type string'), { code: 'ERR_INVALID_ARG_TYPE' });
+      for (let attempt = 0; attempt < 16; attempt++) {
+        const dir = `${prefix}${nodeCrypto.randomBytes(6).toString('base64url').slice(0, 6)}`;
+        if (!v.exists(abs(dir))) { v.mkdir(abs(dir)); return dir; }
+      }
+      throw fdError('EEXIST', `could not create a unique directory from '${prefix}'`);
+    },
+    // A can has no users, so ownership changes have nothing to change.
+    chownSync: (p) => { abs(p); },
+    // A hard link needs inodes the VFS does not have. Refused, with the reason, rather than copied silently.
+    linkSync: () => {
+      throw Object.assign(new Error('ENOTSUP: hard links are not supported in a can'), { code: 'ENOTSUP' });
+    },
+    fstatSync: (fd) => v.stat(entryOf(fd).file),
+    closeSync: (fd) => { entryOf(fd); table.entries.delete(Number(fd)); },
+    fsyncSync: (fd) => { entryOf(fd); },
+    fdatasyncSync: (fd) => { entryOf(fd); },
     readFileSync: (p, o) => v.readFile(abs(p), optsOf(o).encoding ?? undefined),
     writeFileSync: (p, d, o) => v.writeFile(abs(p), d, optsOf(o)),
     appendFileSync: (p, d, o) => v.appendFile(abs(p), d, optsOf(o)),
@@ -166,13 +300,63 @@ function makeFs(rt) {
     return stream;
   };
 
+  // node's callback and promise forms of read and write report the count and the buffer, not just the count.
+  callback.read = (...args) => {
+    const cb = args.pop();
+    let n = 0;
+    let error = null;
+    try { n = readSync(...args); } catch (err) { error = err; }
+    rt.addTimer('timeout', () => (error ? cb(error) : cb(null, n, args[1])), 0, []);
+  };
+  callback.write = (...args) => {
+    const cb = args.pop();
+    let n = 0;
+    let error = null;
+    try { n = writeSync(...args); } catch (err) { error = err; }
+    rt.addTimer('timeout', () => (error ? cb(error) : cb(null, n, args[1])), 0, []);
+  };
+  promises.read = (fd, buffer, offset, length, position) => Promise.resolve().then(() => {
+    const bytesRead = readSync(fd, buffer, offset, length, position);
+    return { bytesRead, buffer };
+  });
+  promises.write = (fd, data, ...rest) => Promise.resolve().then(() => {
+    const bytesWritten = writeSync(fd, data, ...rest);
+    return { bytesWritten, buffer: data };
+  });
+  class FileHandle {
+    constructor(fd) { this.fd = fd; }
+    read(...args) { return promises.read(this.fd, ...args); }
+    write(...args) { return promises.write(this.fd, ...args); }
+    stat() { return promises.fstat(this.fd); }
+    truncate(len) { return promises.ftruncate(this.fd, len); }
+    sync() { return Promise.resolve(); }
+    datasync() { return Promise.resolve(); }
+    readFile(options) { return Promise.resolve().then(() => v.readFile(entryOf(this.fd).file, optsOf(options).encoding ?? undefined)); }
+    writeFile(data, options) { return Promise.resolve().then(() => { ftruncateSync(this.fd, 0); writeSync(this.fd, data, 0, optsOf(options).encoding); }); }
+    close() { return Promise.resolve().then(() => sync.closeSync(this.fd)); }
+  }
+  promises.open = (p, flags, mode) => Promise.resolve().then(() => new FileHandle(openSync(p, flags, mode)));
+
+  // The can has no file watcher. watch() checks the path exists, as node does, and returns an emitter that never
+  // fires, so a program that watches a file keeps running and sees no change events.
+  const watch = (p, options, listener) => {
+    v.stat(abs(p));
+    const watcher = new EventEmitter();
+    if (typeof listener === 'function') watcher.on('change', listener);
+    watcher.close = () => { watcher.emit('close'); };
+    watcher.ref = () => watcher;
+    watcher.unref = () => watcher;
+    return watcher;
+  };
+
   return {
     ...sync,
     ...callback,
     promises,
     createWriteStream,
     createReadStream,
-    constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1 },
+    watch,
+    constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, ...FS_OPEN_CONSTANTS },
   };
 }
 
@@ -196,6 +380,10 @@ function makeChildProcess(rt) {
     child.exitCode = null;
     child.signalCode = null;
     child.killed = false;
+    // As in node, 'spawn' fires once the process has started. Callers such as Effect's spawner wait for it,
+    // so a command that exits at once (for example a missing one, which the shell reports with exit 127) must
+    // still announce its start before it exits.
+    rt.addTimer('timeout', () => child.emit('spawn'), 0, []);
     const onOutput = (pid, stream, buf) => {
       if (pid !== view.pid) return;
       (stream === 'stdout' ? child.stdout : child.stderr).write(buf);

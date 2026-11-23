@@ -10,7 +10,6 @@ import { Machine, checkSnapshot } from './machine.js';
 import { takePage, attachDecoded } from './snapshot-pages.js';
 import { VFS } from '../kernel/vfs.js';
 import { KernelError } from '../kernel/errors.js';
-import { Browser } from '../browser/browser.js';
 import { seedFilesystem, DEFAULT_ENV } from './seed.js';
 import { hardening } from './membrane.js';
 import { encodeError } from './protocol.js';
@@ -58,8 +57,17 @@ const need = () => {
   if (!machine) throw new KernelError('EINVAL', 'EINVAL: this can VM has no can yet');
   return machine;
 };
-const needBrowser = () => {
-  if (!browser) browser = new Browser({ can: need(), internet: need().policy.internet });
+// The browser module is loaded the first time a can uses a browser, not at boot: most cans never open one.
+let browserModule = null;
+const browserClass = async () => {
+  browserModule ??= await import('../browser/browser.js');
+  return browserModule.Browser;
+};
+const needBrowser = async () => {
+  if (!browser) {
+    const Browser = await browserClass();
+    browser = new Browser({ can: need(), internet: need().policy.internet });
+  }
   return browser;
 };
 const meta = () => ({
@@ -77,11 +85,13 @@ const OPS = {
     return meta();
   },
   // Paged snapshots (see snapshot-pages.js): the tree moves one page per request, so no message holds all of it.
+  // The generation is read in the same turn as the records, so it describes exactly the tree being paged out.
   snapshotHead: () => {
     const m = need();
     snapshotPlan = m.vfs.snapshotRecords();
-    return m.snapshotHead();
+    return { ...m.snapshotHead(), generation: m.generation() };
   },
+  generation: () => need().generation(),
   snapshotPage: ({ from }) => {
     if (!snapshotPlan) throw new KernelError('EINVAL', 'EINVAL: no snapshot is being taken');
     return takePage(snapshotPlan, from);
@@ -156,7 +166,7 @@ const OPS = {
   listeners: () => need().vnet.list(),
   browse: async ({ action, args }) => {
     if (!BROWSER_ACTIONS.has(action)) throw new KernelError('EINVAL', `EINVAL: unknown browser action ${action}`);
-    const b = needBrowser();
+    const b = await needBrowser();
     // PNG bytes travel as base64: the reply is JSON. The host decodes them (Can.screenshot).
     if (action === 'screenshot') return b.screenshot(...(args ?? [])).toString('base64');
     if (action === 'state') {
@@ -166,7 +176,8 @@ const OPS = {
     }
     return b[action](...(args ?? []));
   },
-  openBrowser: ({ options }) => {
+  openBrowser: async ({ options }) => {
+    const Browser = await browserClass();
     if (browser) browser.close();
     browser = new Browser({ can: need(), internet: need().policy.internet, ...(options ?? {}) });
     return null;

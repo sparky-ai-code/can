@@ -458,7 +458,8 @@ export class Browser {
    * its importers wait for it. The exports object is created first, so a cycle sees the partial exports.
    */
   async _evaluateModule(host, code, url, exports) {
-    const fn = host.run(`${ASYNC_WRAP_HEAD}${toCommonJs(code, url, { async: true })}\n})`, url);
+    // Built pages are minified: several statements share a line, so an import or export may follow a `;`.
+    const fn = host.run(`${ASYNC_WRAP_HEAD}${toCommonJs(code, url, { async: true, statementStarts: true })}\n})`, url);
     const m = host.membrane;
     const module = { exports };
     const args = [exports, this._moduleRequire(host, url), module, url, url.replace(/[^/]*$/, '')].map((a) => m.sandbox(a));

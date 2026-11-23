@@ -4,8 +4,10 @@
 //   - the registry's packument and tarballs, checked against their sha512 or sha1 integrity;
 //   - a flat node_modules layout with nested copies where versions conflict (like npm, without a lockfile);
 //   - node_modules/.bin shims so package scripts can run `vite`, `tsc` and the like.
+// pnpm monorepo basics: `catalog:` specs and root or pnpm-workspace.yaml `overrides` are resolved from the workspace
+// file, and `workspace:` specs link a sibling package from its folder (copied, not symlinked).
 // Not supported, and reported as warnings or errors: install scripts (postinstall and friends never run), native
-// addons (they cannot load in a can), peer dependencies (not installed), git, file and workspace specs.
+// addons (they cannot load in a can), peer dependencies (not installed), git and file specs, and pnpm's lockfile.
 // Everything here is plain data and functions. The network is reached through the `getBuffer` callback that the
 // caller supplies (see runtime/builtins.js), so the planner can be tested without a network.
 import zlib from 'node:zlib';
@@ -13,6 +15,7 @@ import { posix } from 'node:path';
 import crypto from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { KernelError } from '../kernel/errors.js';
+import { excludeMatcher } from '../transfer.js';
 
 // ---------------------------------------------------------------- semver
 
@@ -294,6 +297,270 @@ export function platformAllows(list, here) {
   return allow.length === 0 || allow.includes(here);
 }
 
+// ---------------------------------------------------------------- pnpm workspaces, catalogs and overrides
+
+const WORKSPACE_FILE = 'pnpm-workspace.yaml';
+const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj ?? {}, key);
+const escapeRe = (s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+
+/** Removes a trailing "# comment" that is not inside quotes. */
+function stripComment(line) {
+  let quote = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '#' && (i === 0 || /\s/.test(line[i - 1]))) {
+      return line.slice(0, i);
+    }
+  }
+  return line;
+}
+
+/** A scalar with its optional quotes removed. */
+function scalar(text) {
+  const t = text.trim();
+  const m = /^(["'])(.*)\1$/.exec(t);
+  return m ? m[2] : t;
+}
+
+/**
+ * Parses the YAML subset that pnpm-workspace.yaml uses: "key: value" maps nested by indentation, "- item" lists and
+ * inline "[a, b]" lists, with optional quotes and # comments. Maps are null-prototype objects, so a key such as
+ * "__proto__" is just data. Anything else (tabs, anchors, multi-line text) is refused with EINVAL rather than misread.
+ * No YAML library is used.
+ */
+export function parseSimpleYaml(text) {
+  const root = Object.create(null);
+  // A frame is an open map or list (value), or a leaf (value null) for a key that has a scalar on its line.
+  const frames = [{ indent: -1, value: root, holder: null, key: null, leaf: false }];
+  const bad = (n, why) => new KernelError('EINVAL', `EINVAL: ${WORKSPACE_FILE} line ${n}: ${why}`);
+  String(text ?? '').split(/\r?\n/).forEach((raw, index) => {
+    const line = stripComment(raw);
+    if (line.trim() === '') return;
+    const indent = line.length - line.trimStart().length;
+    if (line.slice(0, indent).includes('\t')) throw bad(index + 1, 'use spaces, not tabs, for indentation');
+    const content = line.trim();
+    const isItem = content === '-' || content.startsWith('- ');
+    while (frames.length > 1) {
+      const top = frames[frames.length - 1];
+      // A "- item" may sit at the same indent as the key that opens its list (YAML allows that).
+      const listOpen = isItem && (Array.isArray(top.value) || (top.value !== null && Object.keys(top.value).length === 0));
+      if (indent < top.indent || (indent === top.indent && !listOpen)) frames.pop();
+      else break;
+    }
+    const top = frames[frames.length - 1];
+    if (top.leaf) throw bad(index + 1, 'a key with a value on its line cannot have nested lines');
+    if (isItem) {
+      if (!Array.isArray(top.value)) {
+        if (!top.holder || Object.keys(top.value).length > 0) throw bad(index + 1, 'a list item must follow a key with no value');
+        top.value = [];
+        top.holder[top.key] = top.value;
+      }
+      top.value.push(scalar(content.slice(1)));
+      return;
+    }
+    const m = /^("[^"]*"|'[^']*'|[^:]+?)\s*:(?:\s+(.*))?$/.exec(content);
+    if (!m || Array.isArray(top.value)) throw bad(index + 1, `cannot read "${content}"`);
+    const key = scalar(m[1]);
+    const rest = (m[2] ?? '').trim();
+    if (rest === '') {
+      const child = Object.create(null);
+      top.value[key] = child;
+      frames.push({ indent, value: child, holder: top.value, key, leaf: false });
+    } else {
+      top.value[key] = rest.startsWith('[') && rest.endsWith(']')
+        ? rest.slice(1, -1).split(',').map(scalar).filter((s) => s !== '')
+        : scalar(rest);
+      frames.push({ indent, value: null, holder: null, key, leaf: true });
+    }
+  });
+  return root;
+}
+
+/** The parts of pnpm-workspace.yaml this installer uses: packages globs, catalog, catalogs and overrides. */
+export function workspaceConfig(text) {
+  const doc = parseSimpleYaml(text);
+  const map = (v, what) => {
+    if (v === undefined) return Object.create(null);
+    if (!v || typeof v !== 'object' || Array.isArray(v)) throw new KernelError('EINVAL', `EINVAL: ${WORKSPACE_FILE}: ${what} must be a map of names to version ranges`);
+    for (const [k, val] of Object.entries(v)) {
+      if (typeof val !== 'string') throw new KernelError('EINVAL', `EINVAL: ${WORKSPACE_FILE}: ${what}.${k} must be a version range`);
+    }
+    return v;
+  };
+  const catalogs = Object.create(null);
+  if (doc.catalogs !== undefined) {
+    if (!doc.catalogs || typeof doc.catalogs !== 'object' || Array.isArray(doc.catalogs)) {
+      throw new KernelError('EINVAL', `EINVAL: ${WORKSPACE_FILE}: catalogs must be a map of catalog names`);
+    }
+    for (const [name, table] of Object.entries(doc.catalogs)) catalogs[name] = map(table, `catalogs.${name}`);
+  }
+  return {
+    packages: [doc.packages ?? []].flat().filter((p) => typeof p === 'string'),
+    catalog: map(doc.catalog, 'catalog'),
+    catalogs,
+    overrides: map(doc.overrides, 'overrides'),
+  };
+}
+
+/** Turns a package.json or workspace `overrides` map into {overrides, warnings}. parent>child keys are ignored. */
+export function overridesFrom(source, label) {
+  const overrides = Object.create(null);
+  const warnings = [];
+  for (const [key, value] of Object.entries(source ?? {})) {
+    if (key.includes('>')) {
+      warnings.push(`${label}: override "${key}" is a parent>child override, which a can does not support; ignored`);
+    } else if (!isPackageName(key)) {
+      warnings.push(`${label}: override "${key}" is not a package name; ignored`);
+    } else if (typeof value !== 'string') {
+      warnings.push(`${label}: override for ${key} must be a version range (nested overrides are not supported); ignored`);
+    } else if (value.startsWith('$')) {
+      warnings.push(`${label}: override for ${key} refers to "${value}", and $references are not supported; ignored`);
+    } else {
+      overrides[key] = value;
+    }
+  }
+  return { overrides, warnings };
+}
+
+/**
+ * The spec a dependency really requests: an override for the name replaces the range everywhere in the tree, and a
+ * `catalog:` or `catalog:<name>` spec is then looked up in the workspace catalogs. Throws EINVAL naming the
+ * dependency when the catalog does not list it.
+ * @param {{overrides?: object, catalogs?: {default?: object, named?: object}, workspaceFile?: string|null}} workspace
+ */
+export function resolveSpec(name, range, workspace = {}) {
+  const overrides = workspace.overrides ?? {};
+  let spec = hasOwn(overrides, name) && typeof overrides[name] === 'string' ? overrides[name] : range;
+  if (typeof spec === 'string' && spec.startsWith('catalog:')) {
+    const which = spec.slice('catalog:'.length).trim();
+    const catalogs = workspace.catalogs ?? {};
+    const table = which === '' ? catalogs.default : catalogs.named?.[which];
+    const label = which === '' ? 'the default catalog' : `catalog "${which}"`;
+    const where = workspace.workspaceFile ? WORKSPACE_FILE : `${WORKSPACE_FILE} (none found)`;
+    if (!table || !hasOwn(table, name)) {
+      throw new KernelError('EINVAL', `EINVAL: ${name}@${spec}: ${where} has no entry for ${name} in ${label}`);
+    }
+    spec = table[name];
+    if (typeof spec !== 'string' || spec.startsWith('catalog:')) {
+      throw new KernelError('EINVAL', `EINVAL: ${name}@${spec}: the entry for ${name} in ${label} must be a version range`);
+    }
+  }
+  return spec;
+}
+
+export const isWorkspaceSpec = (spec) => typeof spec === 'string' && spec.startsWith('workspace:');
+
+/** The sibling a `workspace:` spec names, as the planner's placement. Refused by name when there is none. */
+function pickWorkspace(name, spec, packages) {
+  const sib = packages?.get(name);
+  if (!sib) {
+    throw new KernelError('EUNSUPPORTED', `EUNSUPPORTED: ${name}@${spec}: no package named ${name} is in this pnpm workspace (the packages: globs of ${WORKSPACE_FILE})`);
+  }
+  const want = spec.slice('workspace:'.length).trim();
+  if (want !== '' && want !== '*' && want !== '^' && want !== '~' && !satisfies(sib.version, want)) {
+    throw new KernelError('ETARGET', `ETARGET: ${name}@${spec}: the workspace package is ${sib.version}, which does not satisfy ${want}`);
+  }
+  return { version: sib.version, manifest: sib.manifest, workspaceDir: sib.dir };
+}
+
+const isDir = (vfs, p) => vfs.exists(p) && vfs.stat(p).isDirectory();
+
+/** The folders that a packages: glob names. Only "*" inside one folder name is supported; "**" and "!" are skipped. */
+function expandPackagePattern(vfs, root, pattern, warnings) {
+  const clean = String(pattern).trim().replace(/^\.\//, '').replace(/\/+$/, '');
+  if (clean.startsWith('!')) {
+    warnings.push(`${WORKSPACE_FILE}: negated pattern ${pattern} is ignored`);
+    return [];
+  }
+  if (clean.includes('**')) {
+    warnings.push(`${WORKSPACE_FILE}: pattern ${pattern} is not supported (only * within one folder name); its packages are not linked`);
+    return [];
+  }
+  let dirs = [root];
+  for (const seg of clean.split('/')) {
+    const next = [];
+    for (const d of dirs) {
+      if (!seg.includes('*')) {
+        const p = posix.join(d, seg);
+        if (isDir(vfs, p)) next.push(p);
+      } else if (isDir(vfs, d)) {
+        const re = new RegExp(`^${seg.split('*').map(escapeRe).join('[^/]*')}$`);
+        for (const name of vfs.readdir(d)) {
+          if (re.test(name) && isDir(vfs, posix.join(d, name))) next.push(posix.join(d, name));
+        }
+      }
+    }
+    dirs = next;
+  }
+  return dirs;
+}
+
+/** Walks up from cwd to the first folder with a pnpm-workspace.yaml, as pnpm does. Null when there is none. */
+export function findWorkspaceRoot(vfs, cwd) {
+  let dir = cwd;
+  for (;;) {
+    if (vfs.exists(posix.join(dir, WORKSPACE_FILE))) return dir;
+    if (dir === '/' || dir === '' || dir === '.') return null;
+    dir = posix.dirname(dir);
+  }
+}
+
+/**
+ * Reads what the planner needs from the workspace around a project: catalogs, overrides (pnpm-workspace.yaml first,
+ * then the project's package.json, which wins on conflict) and the sibling packages named by its packages: globs.
+ * The project's own folder is not one of the siblings. Returns {workspaceFile, catalogs, overrides, packages, warnings}.
+ */
+export function loadWorkspace(vfs, cwd, pkg = null) {
+  const warnings = [];
+  const root = findWorkspaceRoot(vfs, cwd);
+  const config = root
+    ? workspaceConfig(vfs.readFile(posix.join(root, WORKSPACE_FILE), 'utf8'))
+    : { packages: [], catalog: Object.create(null), catalogs: Object.create(null), overrides: Object.create(null) };
+  const packages = new Map();
+  if (root) {
+    for (const pattern of config.packages) {
+      for (const dir of expandPackagePattern(vfs, root, pattern, warnings)) {
+        const file = posix.join(dir, 'package.json');
+        if (!vfs.exists(file)) continue;
+        let manifest;
+        try {
+          manifest = JSON.parse(vfs.readFile(file, 'utf8'));
+        } catch {
+          warnings.push(`${file} is not valid JSON; that workspace package is not linked`);
+          continue;
+        }
+        if (!isPackageName(manifest.name)) {
+          warnings.push(`${file} has no valid package name; that workspace package is not linked`);
+          continue;
+        }
+        if (packages.has(manifest.name)) {
+          warnings.push(`workspace package ${manifest.name} is in two folders; using ${packages.get(manifest.name).dir}`);
+          continue;
+        }
+        const version = typeof manifest.version === 'string' ? manifest.version : '0.0.0';
+        packages.set(manifest.name, { name: manifest.name, version, dir, manifest: { ...manifest, version } });
+      }
+    }
+  }
+  const fromFile = overridesFrom(config.overrides, WORKSPACE_FILE);
+  const fromPkg = overridesFrom(pkg?.overrides, 'package.json');
+  warnings.push(...fromFile.warnings, ...fromPkg.warnings);
+  return {
+    workspaceFile: root ? posix.join(root, WORKSPACE_FILE) : null,
+    catalogs: { default: config.catalog, named: config.catalogs },
+    overrides: { ...fromFile.overrides, ...fromPkg.overrides },
+    packages,
+    warnings,
+  };
+}
+
+/** The libc field: a list such as ["glibc"] or ["musl"]. A can is glibc on linux. */
+export const libcAllows = (list, here = 'glibc') => platformAllows(list, here);
+
 /**
  * Splits an npm alias spec into the registry package and its range: "npm:wrap-ansi@^7" -> {real: "wrap-ansi",
  * range: "^7"}, "npm:@scope/pkg" -> {real: "@scope/pkg", range: "latest"}. Null when the spec is not an alias.
@@ -315,8 +582,11 @@ const nodeModulesFor = (dir) => (dir ? `${dir}/node_modules` : 'node_modules');
  * @param {object} opts
  * @param {Array<{name: string, range?: string, dev?: boolean}>} opts.roots direct dependencies of the project
  * @param {(name: string) => Promise<object>} opts.getPackument returns the registry's document for a package
+ * @param {object} [opts.workspace] from loadWorkspace: {catalogs, overrides, packages, workspaceFile}. Without it,
+ *   catalog and workspace specs are refused by name and overrides do not apply.
+ * @param {string[]} [opts.omit] package names left out, with what only they need (a name match, at any depth)
  */
-export async function planTree({ roots, getPackument }) {
+export async function planTree({ roots, getPackument, workspace = {}, omit = [] }) {
   const packuments = new Map();
   const packument = async (name) => {
     if (!packuments.has(name)) packuments.set(name, getPackument(name));
@@ -325,13 +595,14 @@ export async function planTree({ roots, getPackument }) {
   const placed = new Map(); // path -> entry
   const parentOf = new Map(); // package dir -> dir of the package that requested it ('' for the project)
   const warnings = [];
+  const omitted = new Set(omit);
   const queue = roots.map((r) => ({
     name: r.name, range: r.range ?? 'latest', from: '', dev: r.dev === true, optional: false, requestedBy: 'package.json',
   }));
 
   const pick = async (name, range) => {
-    if (typeof range === 'string' && /^(npm:|git|file:|link:|workspace:|https?:|github:|\.{0,2}\/)/.test(range)) {
-      throw new KernelError('EUNSUPPORTED', `EUNSUPPORTED: ${name}@${range}: only registry versions, dist-tags and npm: aliases are supported in a can (git, file, link, workspace, URL and path specs are not)`);
+    if (typeof range === 'string' && /^(npm:|git|file:|link:|https?:|github:|\.{0,2}\/)/.test(range)) {
+      throw new KernelError('EUNSUPPORTED', `EUNSUPPORTED: ${name}@${range}: only registry versions, dist-tags and npm: aliases are supported in a can (git, file, link, URL and path specs are not)`);
     }
     const pk = await packument(name);
     if (!pk || !pk.versions) throw new KernelError('ETARGET', `ETARGET: no registry entry for ${name}`);
@@ -361,19 +632,35 @@ export async function planTree({ roots, getPackument }) {
     if (!isPackageName(item.name)) {
       throw new KernelError('EINVAL', `EINVAL: ${JSON.stringify(item.name)} is not a valid package name (required by ${item.requestedBy})`);
     }
+    if (omitted.has(item.name)) continue; // --omit: this package and anything only it would bring in are not planned
+    // The requested spec: an override for the name wins, then a catalog: spec is looked up in the workspace.
+    let spec;
+    try {
+      spec = resolveSpec(item.name, item.range, workspace);
+    } catch (err) {
+      err.message = `${err.message} (required by ${item.requestedBy})`;
+      throw err;
+    }
     // An npm alias ("wrap-ansi-cjs": "npm:wrap-ansi@^7.0.0") is installed from the registry package it names,
     // under the alias name. Everything after this line works on the registry name (`real`) and the range.
-    const alias = parseAlias(item.range);
+    const alias = parseAlias(spec);
     if (alias && !isPackageName(alias.real)) {
-      throw new KernelError('EUNSUPPORTED', `EUNSUPPORTED: ${item.name}@${item.range}: "${alias.real}" is not a valid package name (required by ${item.requestedBy})`);
+      throw new KernelError('EUNSUPPORTED', `EUNSUPPORTED: ${item.name}@${spec}: "${alias.real}" is not a valid package name (required by ${item.requestedBy})`);
     }
     const real = alias ? alias.real : item.name;
-    const range = alias ? alias.range : item.range;
+    const range = alias ? alias.range : spec;
+    const linked = isWorkspaceSpec(spec);
     let version;
-    let pk;
+    let manifest;
+    let workspaceDir = null;
     try {
-      version = await pick(real, range);
-      pk = await packument(real);
+      if (linked) {
+        ({ version, manifest, workspaceDir } = pickWorkspace(item.name, spec, workspace.packages));
+      } else {
+        version = await pick(real, range);
+        const pk = await packument(real);
+        manifest = pk.versions[version];
+      }
     } catch (err) {
       if (item.optional) {
         warnings.push(`skipped optional ${item.name}@${item.range}: ${err.message}`);
@@ -382,9 +669,10 @@ export async function planTree({ roots, getPackument }) {
       err.message = `${err.message} (required by ${item.requestedBy})`;
       throw err;
     }
-    const manifest = pk.versions[version];
     const have = visible(item.from, item.name);
-    if (have && (have.version === version || (!isTag(range) && satisfies(have.version, range)))) {
+    // A linked sibling and a registry copy of the same name are different packages, so only like reuses like.
+    const sameKind = have && (have.workspaceDir ?? null) === workspaceDir;
+    if (sameKind && (have.version === version || (!linked && !isTag(range) && satisfies(have.version, range)))) {
       if (item.dev && !have.dev) have.dev = true;
       continue;
     }
@@ -392,6 +680,14 @@ export async function planTree({ roots, getPackument }) {
     if (!platformAllows(manifest.os, 'linux') || !platformAllows(manifest.cpu, 'x64')) {
       warnings.push(`skipped ${item.name}@${version}: it does not support this platform (linux x64)`);
       continue;
+    }
+    if (!libcAllows(manifest.libc, 'glibc')) {
+      const needs = [manifest.libc].flat().join(' or ');
+      if (item.optional) {
+        warnings.push(`skipped optional ${item.name}@${version}: it needs libc ${needs}, and this can has glibc`);
+        continue;
+      }
+      throw new KernelError('EUNSUPPORTED', `EUNSUPPORTED: ${item.name}@${version} needs libc ${needs}, and this can has glibc (required by ${item.requestedBy})`);
     }
 
     // Hoist to the project's node_modules when that name is free; otherwise nest under the requester.
@@ -410,6 +706,7 @@ export async function planTree({ roots, getPackument }) {
       version,
       manifest,
       dist: manifest.dist ?? {},
+      workspaceDir, // set for a linked sibling: its folder is copied, not fetched
       dev: item.dev,
       optional: item.optional,
       requestedBy: item.requestedBy,
@@ -451,6 +748,21 @@ export function binsOf(manifest) {
   return pairs.filter(([name, rel]) => typeof name === 'string' && /^[A-Za-z0-9@._-]+$/.test(name) && typeof rel === 'string' && !rel.split('/').includes('..'));
 }
 
+// A linked workspace package is copied from its folder. node_modules and .git are left out at any depth (the
+// same exclude rule that `can_import` uses); symbolic links are not followed and are reported.
+const COPY_EXCLUDE = excludeMatcher(['node_modules', '.git']);
+function copyFolder(vfs, from, to, warnings) {
+  vfs.mkdir(to, { recursive: true });
+  for (const ent of vfs.readdir(from, { withFileTypes: true })) {
+    if (COPY_EXCLUDE(ent.name)) continue;
+    const src = posix.join(from, ent.name);
+    const dst = posix.join(to, ent.name);
+    if (ent.isSymbolicLink()) warnings.push(`did not copy the symbolic link ${src}`);
+    else if (ent.isDirectory()) copyFolder(vfs, src, dst, warnings);
+    else if (ent.isFile()) vfs.writeFile(dst, vfs.readFile(src));
+  }
+}
+
 /**
  * Writes the planned packages into a can filesystem under cwd. Each tarball is fetched with getTarball(url),
  * checked against its integrity and unpacked. Returns {count, warnings}. Packages are written in plan order, so
@@ -464,17 +776,21 @@ export function binsOf(manifest) {
 export async function materialize({ placed, vfs, cwd, getTarball, warnings = [] }) {
   let count = 0;
   for (const entry of placed.values()) {
-    const bytes = await getTarball(entry.dist.tarball, entry.name, entry.version);
-    verifyIntegrity(bytes, entry.dist);
     const root = posix.join(cwd, entry.path);
-    vfs.mkdir(root, { recursive: true });
-    for (const f of readTarball(bytes)) {
-      const abs = posix.join(root, f.path);
-      if (f.type === 'dir') {
-        vfs.mkdir(abs, { recursive: true });
-      } else {
-        vfs.mkdir(posix.dirname(abs), { recursive: true });
-        vfs.writeFile(abs, f.data);
+    if (entry.workspaceDir) {
+      copyFolder(vfs, entry.workspaceDir, root, warnings);
+    } else {
+      const bytes = await getTarball(entry.dist.tarball, entry.name, entry.version);
+      verifyIntegrity(bytes, entry.dist);
+      vfs.mkdir(root, { recursive: true });
+      for (const f of readTarball(bytes)) {
+        const abs = posix.join(root, f.path);
+        if (f.type === 'dir') {
+          vfs.mkdir(abs, { recursive: true });
+        } else {
+          vfs.mkdir(posix.dirname(abs), { recursive: true });
+          vfs.writeFile(abs, f.data);
+        }
       }
     }
     count++;

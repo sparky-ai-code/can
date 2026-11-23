@@ -5,6 +5,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { mediaMatches } from './render.js';
 import { parseHTML } from './html.js';
+import { createWebSocketClass } from './websocket.js';
 
 /** Element types that get their own DOM class (HTMLDivElement and so on). Each host builds a prototype for each. */
 export const DOM_TAGS = Object.freeze(['input', 'button', 'select', 'textarea', 'form', 'img', 'a', 'div', 'span',
@@ -268,7 +269,7 @@ export function installWebApis(host, sb, env) {
 
 /**
  * Globals that pages probe at boot. Real where it is cheap (console methods, window.parent, File, the 2D canvas
- * context, media element methods); a documented stub otherwise: a WebSocket that is closed and reports an error, a
+ * context, media element methods, WebSocket to the can's own hosts); a documented stub otherwise: a
  * Worker that reports an error, an IndexedDB that fails its request, geolocation that is denied. A stub never throws
  * during boot. It reports failure the way a browser does, so the page takes its fallback path.
  */
@@ -339,26 +340,70 @@ function installExtras(host, sb) {
     abort() { this.readyState = 2; }
   };
 
-  // Failing or closed transports: the page's error path runs, and nothing throws at boot
-  class WebSocket {
-    constructor(url) {
-      this.url = String(url);
-      this.readyState = 3;
-      this.onopen = null;
-      this.onmessage = null;
-      this.onclose = null;
-      this.onerror = null;
+  // A real RFC 6455 client over the can's vnet (see websocket.js). Failures fire error, then close 1006.
+  sb.WebSocket = createWebSocketClass(host);
+  // Custom elements: a page may register them at load time. This renderer does not upgrade elements, so a registered
+  // name is recorded and its constructor can be looked up; elements stay plain. Enough for a page that defines one.
+  const elementRegistry = new Map();
+  sb.customElements = {
+    define(name, ctor) {
+      if (elementRegistry.has(name)) throw new Error(`NotSupportedError: "${name}" has already been defined`);
+      elementRegistry.set(String(name), ctor);
+    },
+    get: (name) => elementRegistry.get(String(name)),
+    whenDefined: (name) => Promise.resolve(elementRegistry.get(String(name))),
+    upgrade() {},
+  };
+  // Browser classes this renderer does not implement. A page may test `x instanceof Name` while it loads, so each name
+  // exists; constructing one throws, saying what is missing. DOMException is real: an Error with a name.
+  const NOT_IMPLEMENTED = [
+    'SVGElement', 'SVGSVGElement', 'MathMLElement', 'ShadowRoot', 'DragEvent', 'ClipboardEvent', 'FileList', 'Request',
+    'Response', 'ReadableStream', 'WritableStream', 'HTMLImageElement', 'HTMLTextAreaElement', 'HTMLAnchorElement',
+    'HTMLIFrameElement', 'HTMLTemplateElement', 'HTMLDialogElement', 'HTMLDetailsElement', 'CSSStyleSheet',
+    'CSSStyleDeclaration', 'CSSRule', 'Selection', 'Range', 'NodeList', 'HTMLCollection', 'Storage', 'History',
+    'Location', 'Navigator', 'Screen', 'MediaQueryList', 'DOMRect', 'FontFace', 'Clipboard', 'ClipboardItem', 'Path2D',
+    'ImageData', 'CanvasRenderingContext2D', 'WebGLRenderingContext', 'Audio', 'Performance', 'PerformanceEntry', 'Attr',
+    'NamedNodeMap', 'CharacterData', 'ProcessingInstruction', 'Plugin', 'MimeType', 'BroadcastChannel',
+    'MessageEvent', 'ProgressEvent', 'CloseEvent', 'StorageEvent', 'HashChangeEvent', 'PopStateEvent', 'TransitionEvent',
+    'AnimationEvent', 'TouchEvent', 'Touch', 'Gamepad', 'Geolocation', 'Permissions', 'PermissionStatus', 'Credential',
+    'ServiceWorkerContainer', 'PushManager', 'Cache', 'CacheStorage', 'IDBDatabase', 'IDBRequest', 'SubtleCrypto',
+    'CryptoKey', 'ReadableStreamDefaultReader', 'TextDecoderStream', 'CompressionStream',
+  ];
+  // MessageChannel: two linked ports. A message is delivered on a later turn, as a browser delivers it, to onmessage
+  // and to 'message' listeners. React's scheduler uses it, so a page that renders needs it.
+  class MessagePort {
+    constructor() { this.onmessage = null; this._other = null; this._closed = false; this._listeners = []; }
+    postMessage(data) {
+      const target = this._other;
+      if (!target || target._closed) return;
       host._timer(() => {
-        if (typeof this.onerror === 'function') this.onerror({ type: 'error' });
-        if (typeof this.onclose === 'function') this.onclose({ type: 'close', code: 1006, reason: '', wasClean: false });
+        const event = { type: 'message', data };
+        if (typeof target.onmessage === 'function') target.onmessage(event);
+        for (const listener of target._listeners.slice()) listener(event);
       }, 0, [], false);
     }
-    send() { throw new Error('InvalidStateError: the WebSocket is not open in this browser'); }
-    close() {}
-    addEventListener() {}
-    removeEventListener() {}
+    addEventListener(type, listener) { if (type === 'message' && typeof listener === 'function') this._listeners.push(listener); }
+    removeEventListener(type, listener) { if (type === 'message') this._listeners = this._listeners.filter((l) => l !== listener); }
+    start() {}
+    close() { this._closed = true; }
   }
-  sb.WebSocket = WebSocket;
+  sb.MessageChannel = class MessageChannel {
+    constructor() {
+      this.port1 = new MessagePort();
+      this.port2 = new MessagePort();
+      this.port1._other = this.port2;
+      this.port2._other = this.port1;
+    }
+  };
+  for (const name of NOT_IMPLEMENTED) {
+    if (sb[name] !== undefined) continue;
+    sb[name] = { [name]: class { constructor() { throw new TypeError(`${name} is not available in this browser`); } } }[name];
+  }
+  if (sb.DOMException === undefined) {
+    sb.DOMException = class DOMException extends Error {
+      constructor(message = '', name = 'Error') { super(message); this.name = String(name); }
+    };
+  }
   sb.Worker = class Worker {
     constructor(url) {
       this.url = String(url);

@@ -82,7 +82,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          node packaging/smoke-test.mjs `
+          node packaging/smoke.mjs `
             --can "$env:CAN_APP\cmd\can.cmd" `
             --can-mcp "$env:CAN_APP\cmd\can-mcp.cmd" `
             --node "$env:CAN_APP\node\node.exe" `
@@ -156,7 +156,7 @@ jobs:
       - name: Smoke test the installed commands and MCP server
         run: |
           set -euo pipefail
-          node packaging/smoke-test.mjs \
+          node packaging/smoke.mjs \
             --can /usr/local/bin/can \
             --can-mcp /usr/local/bin/can-mcp \
             --node /usr/local/lib/can/node/node \

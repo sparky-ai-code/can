@@ -112,3 +112,70 @@ describe('a sandbox prototype on a host object reaches no host intrinsic', () =>
     assert.match(r.stdout, /ownFromProto=1/);
   });
 });
+
+// The ws library's shape: a sandbox class extends a host class (EventEmitter), and its instances hold host objects
+// (the server, the socket) and call methods that write to them. Each of these failed before the membrane fix.
+describe('a sandbox subclass of a host class, as the ws library uses it', () => {
+  test('instances keep their own state, and a listener survives building another instance', async () => {
+    const { r } = await runProgram(`
+      const EE = require('events');
+      class Server extends EE { constructor() { super(); this.tag = 'server'; } }
+      class Conn extends EE { constructor(tag) { super(); this.tag = tag; } }
+      const s = new Server();
+      s.on('connection', () => console.log('listener fired'));
+      const a = new Conn('a');
+      const b = new Conn('b');
+      console.log('tags', a.tag, b.tag, s.tag, 'listeners', s.listenerCount('connection'));
+      s.emit('connection');
+    `);
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.match(r.stdout, /tags a b server listeners 1/);
+    assert.match(r.stdout, /listener fired/);
+  });
+
+  test('a host object stored on an instance reads back as that same object', async () => {
+    const { r } = await runProgram(`
+      const EE = require('events');
+      const http = require('http');
+      class Holder extends EE { constructor(o) { super(); this.server = o.server; } }
+      const srv = http.createServer(() => {});
+      const h = new Holder({ server: srv });
+      console.log('same server', h.server === srv, 'listen is a function', typeof h.server.listen);
+      process.exit(0);
+    `);
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.match(r.stdout, /same server true listen is a function function/);
+  });
+
+  test('a method of an instance writes a sandbox Buffer, with a callback, to the upgrade socket the instance holds', async () => {
+    const { r } = await runProgram(`
+      const EE = require('events');
+      const http = require('http');
+      const net = require('net');
+      class Conn extends EE {
+        constructor(sock) { super(); this.sock = sock; }
+        send(text) {
+          // The header is built here, in the sandbox, as ws builds its frame header, then written as it is.
+          const head = Buffer.from([0x81, text.length]);
+          this.sock.write(head, () => {});
+          this.sock.write(text, () => {});
+        }
+      }
+      const srv = http.createServer(() => {});
+      srv.on('upgrade', (req, sock) => { new Conn(sock).send('hi'); });
+      srv.listen(3014, () => {
+        const client = net.connect(3014, 'localhost', () => {
+          client.write('GET / HTTP/1.1\\r\\nHost: x\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\n\\r\\n');
+        });
+        let got = Buffer.alloc(0);
+        client.on('data', (d) => {
+          got = Buffer.concat([got, d]);
+          if (got.length === 4) { console.log('received', got.toString('hex')); process.exit(0); }
+        });
+      });
+    `);
+    assert.equal(r.exitCode, 0, r.stderr);
+    // Both bytes arrive only if both writes reached the socket, so the bytes are the proof.
+    assert.match(r.stdout, /received 81026869/);
+  });
+});

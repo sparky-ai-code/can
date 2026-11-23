@@ -118,29 +118,112 @@ function makeIncomingResponse(result) {
   return res;
 }
 
+const MAX_UPGRADE_HEAD = 64 * 1024;
+
+/** True when headers (lower-case names) ask to switch to a WebSocket: Connection: Upgrade and Upgrade: websocket. */
+export function isWebSocketUpgrade(headers) {
+  const connection = String(headers.connection ?? '').toLowerCase().split(',').map((t) => t.trim());
+  return connection.includes('upgrade') && String(headers.upgrade ?? '').trim().toLowerCase() === 'websocket';
+}
+
+/** Parses an HTTP/1.x request head ("METHOD target HTTP/1.1" then "name: value" lines). Null when malformed. */
+function parseRequestHead(text) {
+  const [line, ...lines] = text.split('\r\n');
+  const m = /^([A-Z]+) (\S+) HTTP\/1\.[01]$/.exec(line ?? '');
+  if (!m) return null;
+  const headers = new Map();
+  for (const l of lines) {
+    const i = l.indexOf(':');
+    if (i <= 0) return null;
+    const name = l.slice(0, i).trim().toLowerCase();
+    const value = l.slice(i + 1).trim();
+    headers.set(name, headers.has(name) ? `${headers.get(name)}, ${value}` : value);
+  }
+  return { method: m[1], url: m[2], headers: Object.fromEntries(headers) };
+}
+
+/** The net.Socket members that node's ws library and frameworks call on an upgraded socket. Same duplex, more shape. */
+function netSocketShape(sock) {
+  return Object.assign(sock, {
+    remoteAddress: '127.0.0.1', remoteFamily: 'IPv4', remotePort: 0, encrypted: false,
+    setNoDelay() { return this; },
+    setKeepAlive() { return this; },
+    setTimeout() { return this; },
+    ref() { return this; },
+    unref() { return this; },
+  });
+}
+
+/** A listen() form the can cannot honour is refused up front, with a code and a message that names it. */
+function unsupported(what) {
+  return Object.assign(new Error(`ENOTSUP: listen ${what} is not supported in a can (only ports on the can's virtual network)`), { code: 'ENOTSUP' });
+}
+
+function portOf(value) {
+  if (value === undefined || value === null || typeof value === 'function') return 0;
+  const port = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
+  if (typeof port !== 'number' || !Number.isInteger(port)) {
+    throw Object.assign(new RangeError(`ERR_SOCKET_BAD_PORT: port must be an integer, got ${String(value)}`), { code: 'ERR_SOCKET_BAD_PORT' });
+  }
+  return port;
+}
+
+// The can's vnet has no interfaces: a port answers on every loopback name and on all addresses. Any other host
+// would need a real interface, so it is refused rather than silently ignored. backlog is accepted and has no effect.
+const BIND_HOSTS = new Set([undefined, '', '0.0.0.0', '::', '127.0.0.1', '::1', 'localhost']);
+
+/** Reads listen([port][, host][, cb]) and listen(options[, cb]) as node does. Throws for forms the can cannot honour. */
+function parseListenArgs(args) {
+  const [first, second] = args;
+  let port;
+  let host;
+  if (first !== null && typeof first === 'object') {
+    if (first.fd !== undefined || first.handle !== undefined) throw unsupported('on a file descriptor or handle');
+    if (first.path !== undefined) throw unsupported('on a unix socket path');
+    if (first.signal !== undefined) throw unsupported('with an AbortSignal');
+    port = portOf(first.port);
+    host = first.host;
+  } else if (typeof first === 'string' && !/^\d+$/.test(first)) {
+    throw unsupported(`on a unix socket path (${first})`);
+  } else {
+    port = portOf(first);
+    host = typeof second === 'string' ? second : undefined;
+  }
+  if (!BIND_HOSTS.has(host)) {
+    throw Object.assign(new Error(`EADDRNOTAVAIL: cannot listen on ${host}; a can listens on loopback or all addresses only`), { code: 'EADDRNOTAVAIL' });
+  }
+  return port;
+}
+
 export function createHttpModule(rt, scheme) {
   class Server extends EventEmitter {
-    constructor(handler) {
+    constructor(requestListener) {
       super();
-      this.handler = handler;
       this.listener = null;
+      // As in node, a handler given to createServer is a 'request' listener, and it runs alongside any others.
+      if (typeof requestListener === 'function') this.on('request', requestListener);
     }
 
     listen(...args) {
       const cb = args.find((a) => typeof a === 'function');
-      const first = args[0];
-      const port = typeof first === 'number' ? first
-        : typeof first === 'string' && /^\d+$/.test(first) ? Number(first) : 0;
-      const handler = this.handler;
+      const port = parseListenArgs(args);
       const listener = rt.vnet.listen(port, (data) => new Promise((resolve, reject) => {
-        const req = makeIncomingRequest(data);
         const res = new ServerResponse(resolve);
+        // An upgrade needs the raw connection (see acceptRaw). A request that arrives whole cannot switch protocols.
+        if (isWebSocketUpgrade(data.headers ?? {})) {
+          res.writeHead(426, { 'content-type': 'text/plain', connection: 'Upgrade', upgrade: 'websocket' });
+          res.end('Upgrade Required: a WebSocket upgrade must arrive as a raw connection');
+          return;
+        }
+        const req = makeIncomingRequest(data);
         try {
-          if (handler) handler(req, res);
+          this.emit('request', req, res);
         } catch (err) {
           reject(err);
         }
       }));
+      // A raw connection (vnet.connect) carries an upgrade request. The vnet only delivers it when this listener exists.
+      listener.on('connection', (sock) => this.acceptRaw(sock));
       this.listener = listener;
       rt.addPort(listener.port);
       rt.addTimer('timeout', () => {
@@ -148,6 +231,52 @@ export function createHttpModule(rt, scheme) {
         if (cb) cb();
       }, 0, []);
       return this;
+    }
+
+    /**
+     * A raw connection carries one HTTP upgrade request. Its head is read here; the socket then goes to 'upgrade'
+     * listeners as (req, socket, head), where head holds the bytes that followed the head in the same packet. As in
+     * node, a socket with no 'upgrade' listener is destroyed, and a connection that is not an upgrade gets a 400.
+     * The 101 answer is written by the listener (the ws library does this), so the bytes reach the client as written.
+     */
+    acceptRaw(sock) {
+      let pending = Buffer.alloc(0);
+      const onError = () => sock.destroy();
+      sock.on('error', onError);
+      const onData = (chunk) => {
+        pending = Buffer.concat([pending, chunk]);
+        const at = pending.indexOf('\r\n\r\n');
+        if (at < 0) {
+          if (pending.length > MAX_UPGRADE_HEAD) {
+            sock.removeListener('data', onData);
+            sock.end('HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+          }
+          return;
+        }
+        sock.removeListener('data', onData);
+        const parsed = parseRequestHead(pending.subarray(0, at).toString('latin1'));
+        if (!parsed || !isWebSocketUpgrade(parsed.headers)) {
+          sock.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+          return;
+        }
+        const head = Buffer.from(pending.subarray(at + 4));
+        pending = null;
+        if (this.listenerCount('upgrade') === 0) {
+          sock.destroy();
+          return;
+        }
+        netSocketShape(sock);
+        const req = makeIncomingRequest({ method: parsed.method, url: parsed.url, headers: parsed.headers, body: null });
+        req.socket = req.connection = sock;
+        // Listeners must attach their 'data' listener synchronously (ws does), or bytes that arrive later are lost.
+        try {
+          this.emit('upgrade', req, sock, head);
+        } catch (err) {
+          sock.destroy();
+          rt.fail(err);
+        }
+      };
+      sock.on('data', onData);
     }
 
     address() {
@@ -304,7 +433,8 @@ export function createHttpModule(rt, scheme) {
     Server,
     STATUS_CODES,
     METHODS: ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT'],
-    createServer: (handler) => new Server(handler),
+    // createServer([options][, requestListener]). The options object is accepted and ignored.
+    createServer: (options, requestListener) => new Server(typeof options === 'function' ? options : requestListener),
     request,
     get,
     ClientRequest,

@@ -411,6 +411,7 @@ describe('end to end: an agent builds, runs and tests a multi-file web app in a 
 
   test('destroy the can at the end', async () => {
     assert.match(await client.ok('can_destroy', { can: 'shop' }), /destroyed can "shop"/);
-    assert.equal(fs.readdirSync(storeDir).filter((f) => f.endsWith('.json')).length, 0);
+    // index.json is the store's cache of the can files (src/store-index.js), not a can, so it does not count.
+    assert.equal(fs.readdirSync(storeDir).filter((f) => f.endsWith('.json') && f !== 'index.json').length, 0);
   });
 });
