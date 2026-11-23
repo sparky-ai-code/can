@@ -51,6 +51,8 @@ export function vmPaths({ platform = process.platform, arch = guestArchFor(platf
   return {
     qemu: env.CAN_QEMU ?? path.join(appRoot, 'vmm', `qemu-system-${arch}${exe}`),
     shareDir: path.join(appRoot, 'vmm', 'share'),
+    qemuImg: env.CAN_QEMU_IMG ?? path.join(path.dirname(env.CAN_QEMU ?? path.join(appRoot, 'vmm', 'x')), `qemu-img${exe}`),
+    tools: env.CAN_TOOLS_DISK ?? path.join(guestDir, 'tools.img'),
     kernel: path.join(guestDir, arch, 'vmlinuz'),
     initrd: path.join(guestDir, arch, 'initrd.img'),
   };
@@ -130,7 +132,10 @@ export function buildQemuArgs(o) {
 
   const m = machineFor(arch, accel, o.machine);
   const dev = (base) => (m.bus === 'pci' ? `${base}-pci` : `${base}-device`);
-  const args = ['-name', `${name},process=${name}`, '-nodefaults', '-no-user-config', '-display', 'none', '-monitor', 'none'];
+  // -monitor none turns off the default monitor. It must not be combined with a monitor-qmp object (QEMU exits), so the
+  // QMP case below leaves the default monitor off by the object alone.
+  const args = ['-name', `${name},process=${name}`, '-nodefaults', '-no-user-config', '-display', 'none'];
+  if (!o.qmp?.chardev) args.push('-monitor', 'none');
   if (o.shareDir) args.push('-L', o.shareDir);
   args.push('-M', m.opts, '-cpu', cpuFor(accel), '-m', `${memMB}M`, '-smp', String(cpus));
   args.push('-kernel', kernel, '-initrd', initrd);
@@ -142,7 +147,11 @@ export function buildQemuArgs(o) {
 
   args.push('-chardev', agent.chardev, '-device', dev('virtio-serial'));
   args.push('-device', `virtserialport,chardev=${/id=([^,]+)/.exec(agent.chardev)[1]},name=${AGENT_PORT_NAME}`);
-  if (o.qmp?.chardev) args.push('-chardev', o.qmp.chardev, '-mon', `chardev=${/id=([^,]+)/.exec(o.qmp.chardev)[1]},mode=control`);
+  // The QMP control channel. QEMU 11 deprecates -mon in favour of a monitor-qmp object; with -mon the pipe was never created.
+  if (o.qmp?.chardev) {
+    const qmpId = /id=([^,]+)/.exec(o.qmp.chardev)[1];
+    args.push('-chardev', o.qmp.chardev, '-object', `monitor-qmp,id=mon-${qmpId},chardev=${qmpId}`);
+  }
 
   (o.disks ?? []).forEach((disk, i) => {
     const parts = [`file=${qemuEscape(disk.file)}`, 'if=none', `id=disk${i}`, `format=${disk.format ?? 'raw'}`];

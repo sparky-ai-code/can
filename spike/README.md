@@ -87,3 +87,20 @@ Limits:
 - The packaged app stays in the guest. Moving a 250 MB output to the host needs chunked transfer, which the agent does
   not have yet (READ returns one frame, at most about 16 MB).
 - npm used the registry and the Electron binary from the internet, so the first run is slow. Reruns reuse the disk.
+
+## Save and restore: by disk
+
+QEMU's own VM snapshots do not work for these guests on this host:
+- With the WHPX accelerator, `savevm` is refused: "missing dirty memory tracking support" and "system register/state
+  save-restore". It is refused while the guest runs and while it is stopped.
+- With the software accelerator (TCG), the guest did not answer HELLO within 20 minutes, so a snapshot could not be
+  taken in a reasonable time.
+
+So save and restore work by disk. Each VM can has its own writable qcow2 overlay on the read-only tools disk. Its home
+folder is on that disk (`/opt/can/home`). Save shuts the guest down cleanly. Restore boots a new guest on the same
+disk. A file written before the save is there after the restore (`test/vm-save.test.js`, 2 of 2 on WHPX).
+
+Processes, ports and the agent's state do not survive a save. `can_restart` in the lite backend documents the same.
+
+QMP is also set up as `-object monitor-qmp`, which works over a named pipe. But one QEMU quirk matters here: `-monitor
+none` makes QEMU exit as soon as a monitor object is added, so the builder leaves it out when QMP is set.
