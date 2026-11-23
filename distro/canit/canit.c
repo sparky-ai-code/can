@@ -804,6 +804,16 @@ static void init_system(void) {
   mount_one("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC);
   mount_one("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV);
   mount_one("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV);
+  /* An optional data disk (the first virtio-blk, vda) holds the tools for builds, mounted read-write at /opt/can.
+   * A guest without the disk simply has no /opt/can. */
+  if (access("/dev/vda", F_OK) == 0) {
+    mkdir("/opt", 0755);
+    mount_one("/dev/vda", "/opt/can", "ext4", 0);
+    /* The disk carries the glibc runtime that the tools link against. Binaries name /lib64/ld-linux-x86-64.so.2 and
+     * look for libraries under /lib, so those two paths point into the disk. */
+    if (symlink("/opt/can/lib", "/lib") < 0 && errno != EEXIST) fprintf(stderr, "canit: symlink /lib: %s\n", strerror(errno));
+    if (symlink("/opt/can/lib64", "/lib64") < 0 && errno != EEXIST) fprintf(stderr, "canit: symlink /lib64: %s\n", strerror(errno));
+  }
   if (sethostname("can", 3) < 0) fprintf(stderr, "canit: sethostname: %s\n", strerror(errno));
   loopback_up();
 }

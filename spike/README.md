@@ -65,3 +65,25 @@ both pass.
 
 The agent handles one request at a time, as its header says. Concurrent exec, spawn, files and ports are the next
 step of the backend.
+
+## Electron build step
+
+`spike/electron-build.mjs` builds a small Electron app for Windows (x64) inside a guest:
+
+1. `sh build-tools-disk.sh <node dir> guest/tools.img` makes the tools disk: a 2 GB ext4 image with Node.js 24 and the
+   glibc runtime Node needs. The guest mounts it at `/opt/can`, and canit points `/lib` and `/lib64` into it.
+2. The guest starts with user-mode networking (10.0.2.15 behind 10.0.2.2, DNS 10.0.2.3), a 2 GB memory limit, and the
+   clock set from the host, since the machine has no RTC.
+3. npm installs the app's dependencies (install scripts run in the guest), then electron-packager builds the app for
+   win32 x64.
+
+Measured: the build exits 0 on WHPX in 53 seconds, and `dist/Notify-win32-x64/Notify.exe` (250 MB) is in the guest
+(`electron-report.json`).
+
+Limits:
+- The app's `package.json` has no `version`. electron-packager infers `appVersion` from it, and an `appVersion` makes
+  it edit the exe's version resources, which needs Wine on a non-Windows host. So the exe keeps Electron's default
+  version resources. Setting real ones needs Wine.
+- The packaged app stays in the guest. Moving a 250 MB output to the host needs chunked transfer, which the agent does
+  not have yet (READ returns one frame, at most about 16 MB).
+- npm used the registry and the Electron binary from the internet, so the first run is slow. Reruns reuse the disk.

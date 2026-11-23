@@ -327,7 +327,7 @@ async function connectChannel(target, child) {
 }
 
 /** One launch with one accelerator. Throws (and kills QEMU) when the guest does not come up. */
-async function launch({ name, dir, paths, accel, arch, memMB, platform, log }) {
+async function launch({ name, dir, paths, accel, arch, memMB, platform, log, internet, disks }) {
   const endpoint = channelEndpoint({ platform, dir, name: `${name}-agent`, id: 'agent0' });
   if (platform !== 'win32') fs.rmSync(endpoint.connect, { force: true });
   const serialLog = path.join(dir, `${name}-serial.log`);
@@ -340,7 +340,8 @@ async function launch({ name, dir, paths, accel, arch, memMB, platform, log }) {
     memMB,
     agent: { chardev: endpoint.chardev },
     serialLog,
-    internet: false,
+    internet: Boolean(internet),
+    disks,
     shareDir: fs.existsSync(paths.shareDir) ? paths.shareDir : undefined,
   });
   log(`starting QEMU with ${accel}`);
@@ -372,7 +373,7 @@ async function launch({ name, dir, paths, accel, arch, memMB, platform, log }) {
  * @param {function} [o.log]
  */
 export async function startGuest({
-  name, dir, memMB = 256, platform = process.platform, env = process.env, log = () => {},
+  name, dir, memMB = 256, internet = false, disks = [], platform = process.platform, env = process.env, log = () => {},
 } = {}) {
   const paths = vmPaths({ platform, env });
   if (!vmInstalled(paths)) {
@@ -384,7 +385,7 @@ export async function startGuest({
   const failures = [];
   for (const accel of accelCandidates({ platform, env, kvmPresent: fs.existsSync('/dev/kvm') })) {
     try {
-      return await launch({ name, dir, paths, accel, arch, memMB, platform, log });
+      return await launch({ name, dir, paths, accel, arch, memMB, internet, disks, platform, log });
     } catch (err) {
       failures.push(`${accel}: ${err.message}`);
       log(`the ${accel} accelerator did not start the guest: ${err.message}`);
