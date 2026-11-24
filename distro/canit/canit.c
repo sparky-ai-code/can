@@ -12,6 +12,8 @@
  *   PING  0x02   -> the same payload
  *   EXEC  0x10   u32le timeoutMs | cwd\0 | argv0\0 argv1\0 ...  -> i32le exit | u8 timedOut | u32le outLen | u32le errLen | out | err
  *   POWEROFF 0x20 -> empty reply, then the machine powers off (or the process exits, in --stdio mode)
+ *   WRITE 0x30   u32le mode | path\0 | data  -> empty reply. Creates or replaces the file; its folder must exist.
+ *   READ  0x31   path\0  -> the file's bytes. A folder, or a file larger than one frame, is an error.
  *
  * Known limits of this first version, kept on purpose:
  *   - one request at a time: an EXEC blocks the agent until the command ends (concurrent exec, spawn, files, ports are next);
@@ -46,7 +48,7 @@
 #define OUTPUT_CAP (1024u * 1024u)
 #define AGENT_PORT "can.agent"
 
-enum { T_HELLO = 0x01, T_PING = 0x02, T_EXEC = 0x10, T_POWEROFF = 0x20, T_REPLY = 0x80, T_ERROR = 0xff };
+enum { T_HELLO = 0x01, T_PING = 0x02, T_EXEC = 0x10, T_POWEROFF = 0x20, T_WRITE = 0x30, T_READ = 0x31, T_REPLY = 0x80, T_ERROR = 0xff };
 
 static int in_fd = 0, out_fd = 1;
 static int is_init = 0;
@@ -185,6 +187,94 @@ static void do_exec(uint32_t id, const uint8_t *payload, uint32_t len) {
 
 /* ---- serving ---- */
 
+/* ---- files ---- */
+
+/* WRITE: u32le mode | path\0 | data. Creates the file, or truncates and replaces it. */
+static void do_write(uint32_t id, const uint8_t *payload, uint32_t len) {
+  if (len < 6) { send_error(id, "write: the request is too short"); return; }
+  uint32_t mode = get_u32(payload) & 07777u;
+  const uint8_t *path = payload + 4;
+  const uint8_t *nul = memchr(path, 0, (size_t)(len - 4));
+  if (!nul || nul == path) { send_error(id, "write: a path is needed, ending with a zero byte"); return; }
+  const char *name = (const char *)path;
+  const uint8_t *data = nul + 1;
+  size_t dlen = (size_t)(payload + len - data);
+  int fd = open(name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode ? (mode_t)mode : (mode_t)0644);
+  if (fd < 0) {
+    char msg[512];
+    snprintf(msg, sizeof msg, "write %s: %s", name, strerror(errno));
+    send_error(id, msg);
+    return;
+  }
+  int ok = write_full(fd, data, dlen) == 0;
+  int saved = errno;
+  if (close(fd) != 0 && ok) { ok = 0; saved = errno; }
+  if (!ok) {
+    char msg[512];
+    snprintf(msg, sizeof msg, "write %s: %s", name, strerror(saved));
+    send_error(id, msg);
+    return;
+  }
+  send_frame(T_WRITE | T_REPLY, id, NULL, 0);
+}
+
+/* READ: path\0 -> the file's bytes, up to what one frame can carry. */
+static void do_read(uint32_t id, const uint8_t *payload, uint32_t len) {
+  if (len < 2 || payload[len - 1] != 0) { send_error(id, "read: the path must end with a zero byte"); return; }
+  const char *name = (const char *)payload;
+  int fd = open(name, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    char msg[512];
+    snprintf(msg, sizeof msg, "read %s: %s", name, strerror(errno));
+    send_error(id, msg);
+    return;
+  }
+  struct stat st;
+  if (fstat(fd, &st) != 0) {
+    char msg[512];
+    snprintf(msg, sizeof msg, "read %s: %s", name, strerror(errno));
+    close(fd);
+    send_error(id, msg);
+    return;
+  }
+  if (S_ISDIR(st.st_mode)) {
+    char msg[512];
+    snprintf(msg, sizeof msg, "read %s: is a folder", name);
+    close(fd);
+    send_error(id, msg);
+    return;
+  }
+  const size_t cap = MAX_FRAME - 5u - 1024u; /* the reply's own header and a margin */
+  size_t size = st.st_size > 0 ? (size_t)st.st_size : 4096;
+  if (size > cap) size = cap;
+  size_t n = 0;
+  uint8_t *buf = malloc(size);
+  if (!buf) { close(fd); send_error(id, "read: out of memory"); return; }
+  for (;;) {
+    if (n == size) {
+      if (size >= cap) { free(buf); close(fd); send_error(id, "read: the file is larger than one frame"); return; }
+      size_t next = size * 2 > cap ? cap : size * 2;
+      uint8_t *grown = realloc(buf, next);
+      if (!grown) { free(buf); close(fd); send_error(id, "read: out of memory"); return; }
+      buf = grown;
+      size = next;
+    }
+    ssize_t r = read(fd, buf + n, size - n);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      char msg[512];
+      snprintf(msg, sizeof msg, "read %s: %s", name, strerror(errno));
+      free(buf); close(fd); send_error(id, msg);
+      return;
+    }
+    if (r == 0) break;
+    n += (size_t)r;
+  }
+  close(fd);
+  send_frame(T_READ | T_REPLY, id, buf, (uint32_t)n);
+  free(buf);
+}
+
 static void reap_orphans(void) {
   while (waitpid(-1, NULL, WNOHANG) > 0) {}
 }
@@ -225,6 +315,8 @@ static void serve(void) {
       }
       case T_PING: send_frame(T_PING | T_REPLY, id, payload, plen); break;
       case T_EXEC: do_exec(id, payload, plen); break;
+      case T_WRITE: do_write(id, payload, plen); break;
+      case T_READ: do_read(id, payload, plen); break;
       case T_POWEROFF: send_frame(T_POWEROFF | T_REPLY, id, NULL, 0); free(body); power_off(); return;
       default: {
         char msg[64];
