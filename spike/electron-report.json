@@ -1,0 +1,56 @@
+{
+  "startedAt": "2026-11-23T22:24:34.137Z",
+  "accel": "whpx",
+  "steps": {
+    "network-up": {
+      "exitCode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    "address": {
+      "exitCode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    "route": {
+      "exitCode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    "clock": {
+      "exitCode": 0,
+      "stdout": "Mon Nov 23 22:24:35 UTC 2026\n",
+      "stderr": ""
+    },
+    "mkdir": {
+      "exitCode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    "node-version": {
+      "exitCode": 0,
+      "stdout": "v24.15.0\n",
+      "stderr": ""
+    },
+    "output": {
+      "exitCode": 0,
+      "stdout": "total 315452\ndrwx------    4 0        0             4096 Nov 23 22:24 .\ndrwxr-xr-x    3 0        0             4096 Nov 23 22:24 ..\n-rw-r--r--    1 0        0             1096 Nov 23 22:24 LICENSE\n-rw-r--r--    1 0        0          5705935 Nov 23 22:24 LICENSES.chromium.html\n-rwxr-xr-x    1 0        0        249978368 Nov 23 22:24 Notify.exe\n-rw-r--r--    1 0        0           568479 Nov 23 22:24 chrome_100_percent.pak\n-rw-r--r--    1 0        0           927818 Nov 23 22:24 chrome_200_percent.pak\n-rw-r--r--    1 0        0          4753864 Nov 23 22:24 d3dcompiler_47.dll\n-rw-r--r--    1 0        0         25779712 Nov 23 22:24 dxcompiler.dll\n-rw-r--r--    1 0        0           425472 Nov 23 22:24 electron_wer.dll\n-rw-r--r--    1 0        0          3097600 Nov 23 22:24 ffmpeg.dll\n-rw-r--r--    1 0        0         10824576 Nov 23 22:24 icudtl.dat\ndrwxr-xr-x    2 0        0             4096 Nov 23 22:24 locales\ndrwxr-xr-x    3 0        0             4096 Nov 23 22:24 resources\n-rw-r--r--    1 0        0         13372210 Nov 23 22:24 resources.pak\n-rw-r--r--    1 0        0           374568 Nov 23 22:24 snapshot_blob.bin\n-rw-r--r--    1 0        0           753600 Nov 23 22:24 v8_context_snapshot.bin\n-rw-r--r--    1 0        0                6 Nov 23 22:24 version\n-rw-r--r--    1 0        0          5452800 Nov 23 22:24 vk_swiftshader.dll\n-rw-r--r--    1 0        0              106 Nov 23 22:24 vk_swiftshader_icd.json\n-rw-r--r--    1 0        0           957440 Nov 23 22:24 vulkan-1.dll\n",
+      "stderr": ""
+    },
+    "exe": {
+      "exitCode": 0,
+      "stdout": "-rwxr-xr-x    1 0        0        249978368 Nov 23 22:24 /opt/can/work/notify/dist/Notify-win32-x64/Notify.exe\n",
+      "stderr": ""
+    }
+  },
+  "build": {
+    "exitCode": 0,
+    "stdout": "\nup to date in 3s\nBUILD-DONE\n",
+    "stderr": "Packaging app for platform win32 x64 using electron v45.4.1\nWrote new app to: dist/Notify-win32-x64\n"
+  },
+  "ok": true,
+  "output": "total 315452\ndrwx------    4 0        0             4096 Nov 23 22:24 .\ndrwxr-xr-x    3 0        0             4096 Nov 23 22:24 ..\n-rw-r--r--    1 0        0             1096 Nov 23 22:24 LICENSE\n-rw-r--r--    1 0        0          5705935 Nov 23 22:24 LICENSES.chromium.html\n-rwxr-xr-x    1 0        0        249978368 Nov 23 22:24 Notify.exe\n-rw-r--r--    1 0        0           568479 Nov 23 22:24 chrome_100_percent.pak\n-rw-r--r--    1 0        0           927818 Nov 23 22:24 chrome_200_percent.pak\n-rw-r--r--    1 0        0          4753864 Nov 23 22:24 d3dcompiler_47.dll\n-rw-r--r--    1 0        0         25779712 Nov 23 22:24 dxcompiler.dll\n-rw-r--r--    1 0        0           425472 Nov 23 22:24 electron_wer.dll\n-rw-r--r--    1 0        0          3097600 Nov 23 22:24 ffmpeg.dll\n-rw-r--r--    1 0        0         10824576 Nov 23 22:24 icudtl.dat\ndrwxr-xr-x    2 0        0             4096 Nov 23 22:24 locales\ndrwxr-xr-x    3 0        0             4096 Nov 23 22:24 resources\n-rw-r--r--    1 0        0         13372210 Nov 23 22:24 resources.pak\n-rw-r--r--    1 0        0           374568 Nov 23 22:24 snapshot_blob.bin\n-rw-r--r--    1 0        0           753600 Nov 23 22:24 v8_context_snapshot.bin\n-rw-r--r--    1 0        0                6 Nov 23 22:24 version\n-rw-r--r--    1 0        0          5452800 Nov 23 22:24 vk_swiftshader.dll\n-rw-r--r--    1 0        0              106 Nov 23 22:24 vk_swiftshader_icd.json\n-rw-r--r--    1 0        0           957440 Nov 23 22:24 vulkan-1.dll\n",
+  "exe": "-rwxr-xr-x    1 0        0        249978368 Nov 23 22:24 /opt/can/work/notify/dist/Notify-win32-x64/Notify.exe",
+  "finishedAt": "2026-11-23T22:25:19.416Z",
+  "seconds": 53
+}
