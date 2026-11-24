@@ -104,7 +104,8 @@ test('balloon is on, and free-page reporting only when asked', () => {
 
 test('the control channel is added when given', () => {
   const args = buildQemuArgs(base({ qmp: { chardev: 'pipe,id=qmp,path=q' } }));
-  assert.deepEqual(pairs(args, '-mon'), ['chardev=qmp,mode=control']);
+  assert.deepEqual(pairs(args, '-object'), ['monitor-qmp,id=mon-qmp,chardev=qmp']);
+  assert.equal(args.includes('-mon'), false, 'the deprecated -mon is not used');
 });
 
 test('bad input is refused with a next step', () => {

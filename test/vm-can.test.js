@@ -60,7 +60,7 @@ describe('a VM can', { skip: SKIP }, () => {
   test('network: a server in the can is listed and answers request as Can does', { timeout: 60000 }, async () => {
     await web.mkdir('www', { recursive: true });
     await web.writeFile('www/index.html', 'from the vm can\n');
-    const srv = await web.spawn('/bin/busybox httpd -f -p 8080 -h /home/agent/www');
+    const srv = await web.spawn('/bin/busybox httpd -f -p 8080 -h /opt/can/home/www');
     try {
       let listed = [];
       for (let i = 0; i < 100 && !listed.some((l) => l.port === 8080); i++) {
