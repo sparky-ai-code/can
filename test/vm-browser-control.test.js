@@ -10,6 +10,8 @@ import path from 'node:path';
 import { VmCanManager } from '../src/vm/vm-can.js';
 import { vmInstalled, vmPaths } from '../src/vm/qemu.js';
 import { ChromiumBrowsers } from '../src/canchromium.js';
+import { CanRegistry } from '../src/registry.js';
+import { createTools } from '../src/mcp/tools.js';
 
 const paths = vmPaths();
 const SKIP = vmInstalled(paths) && fs.existsSync(paths.tools) && fs.existsSync(paths.browser)
@@ -78,6 +80,41 @@ describe('interactive browser control in a VM can', { skip: SKIP }, () => {
     await assert.rejects(plain.browse('snapshot'), (e) => e.code === 'ENOTSUP');
     await assert.rejects(plain.screenshot(), (e) => e.code === 'ENOTSUP');
     await manager.destroy(plain.id);
+  });
+
+  test('the MCP tools drive a VM can browser: can_create with browser, then goto, type, click and snapshot', { timeout: 400000 }, async () => {
+    const registry = new CanRegistry({
+      backend: 'vm', storeDir: path.join(dir, 'store'), vmDir: path.join(dir, 'vm-mcp'),
+    });
+    const tools = createTools(registry, {
+      transferRoot: path.join(dir, 'transfer'),
+      browsers: new ChromiumBrowsers({ executable: null }),
+    });
+    const call = (name, args) => tools.find((t) => t.name === name).run(args);
+    try {
+      const created = await call('can_create', { name: 'mcpweb', browser: true });
+      assert.match(created, /created can "mcpweb"/);
+      const web = await registry.get('mcpweb');
+      await web.mkdir('site', { recursive: true });
+      await web.writeFile('site/index.html', PAGE);
+      await web.spawn('/bin/busybox httpd -f -p 8080 -h /opt/can/home/site', { cwd: '/' });
+      for (let i = 0; i < 50; i++) {
+        try {
+          if ((await web.request({ port: 8080, path: '/', timeout: 2000 })).status === 200) break;
+        } catch { /* still starting */ }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+
+      const went = await call('browser_goto', { can: 'mcpweb', url: 'http://localhost:8080/' });
+      assert.match(went, /HTTP status: 200/);
+      assert.match(went, /Page: "Form demo"/);
+      await call('browser_type', { can: 'mcpweb', target: '#name', text: 'Grace' });
+      const clicked = await call('browser_click', { can: 'mcpweb', target: 'Save' });
+      assert.match(clicked, /Hi Grace/);
+      assert.match(await call('browser_snapshot', { can: 'mcpweb' }), /Hi Grace/);
+    } finally {
+      await registry.destroy('mcpweb').catch(() => {});
+    }
   });
 
   test('destroy closes the browser and powers the guest off', { timeout: 120000 }, async () => {

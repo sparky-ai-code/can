@@ -183,13 +183,17 @@ export class CanRegistry {
    * `environment` is an optional spec applied before the can starts (see src/environment.js).
    * Transactional: if any step fails, or the save fails, the VM is stopped, nothing is left on disk and the name is free.
    */
-  async create(name, { mounts = [], environment } = {}) {
+  async create(name, { mounts = [], environment, browser = false } = {}) {
     if (this.vm) {
       const taken = this.vm.get(name) || this.vm.index().some((r) => r.name === name);
       if (name !== undefined && name !== null && taken) {
         throw new KernelError('EEXIST', `EEXIST: a can named "${name}" already exists. Next: use another name, or can_destroy it first.`);
       }
-      return this.vm.create({ name: name ?? undefined, mounts, environment });
+      // browser: a VM can starts Chromium only when asked (it needs the browser disk and more memory). Lite cans always
+      // have a browser, so the flag does nothing there.
+      return this.vm.create({
+        name: name ?? undefined, mounts, environment, browser,
+      });
     }
     const finalName = name === undefined || name === null ? this._autoName() : checkName(name);
     // The checks and the reservation run before the first await, so two creates cannot race.
@@ -219,7 +223,7 @@ export class CanRegistry {
    * returns {can, reused: true, state} where state is the can's status ('running', or 'saved' when it is on disk
    * only). A different spec is EEXIST. A name that is free is created. Returns {can, reused: false, state: 'running'}.
    */
-  async ensure(name, { mounts = [], environment } = {}) {
+  async ensure(name, { mounts = [], environment, browser = false } = {}) {
     if (this.vm && name !== undefined && name !== null) {
       const live = this.vm.get(name);
       const rec = live ? null : this.vm.index().find((r) => r.name === name);
@@ -227,7 +231,7 @@ export class CanRegistry {
         const can = live ?? (await this.vm.restore(rec.id));
         return { can, reused: true, state: live ? 'running' : 'saved', id: can.id };
       }
-      const can = await this.create(name, { mounts, environment });
+      const can = await this.create(name, { mounts, environment, browser });
       return { can, reused: false, state: 'running', id: can.id };
     }
     if (name !== undefined && name !== null) {
