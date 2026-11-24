@@ -7,7 +7,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  FrameDecoder, T, decodeExecResult, decodeHello, encodeExec, encodeFrame, encodeRead, encodeWrite, OUTPUT_CAP,
+  FrameDecoder, T, decodeExecResult, decodeHello, decodePs, decodeStatus, encodeExec, encodeFrame, encodeKill,
+  encodeLogs, encodeProgram, encodeRead, encodeSpawn, encodeWrite, OUTPUT_CAP,
 } from '../src/vm/guest-protocol.js';
 
 const SOURCE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'distro', 'canit', 'canit.c');
@@ -197,4 +198,96 @@ test('write replaces an existing file; read refuses a folder and a missing file 
     await agent.request(T.EXEC, encodeExec({ argv: ['/bin/rm', '-rf', dir] }));
     await agent.close();
   }
+});
+
+// Background programs: SPAWN, LOGS, STATUS, KILL, PS, STDIN, END_STDIN.
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function spawnBg(agent, argv, cwd = '') {
+  const r = await agent.request(T.SPAWN, encodeSpawn({ argv, cwd }));
+  assert.equal(r.type, T.SPAWN | T.REPLY, `spawn reply was ${r.type}: ${r.payload}`);
+  return r.payload.readUInt32LE(0);
+}
+
+async function untilExited(agent, id, ms = 10000) {
+  const end = Date.now() + ms;
+  for (;;) {
+    const r = await agent.request(T.STATUS, encodeProgram(id));
+    assert.equal(r.type, T.STATUS | T.REPLY, `status reply was ${r.type}: ${r.payload}`);
+    const s = decodeStatus(r.payload);
+    if (!s.running) return s;
+    if (Date.now() > end) throw new Error(`program ${id} did not exit within ${ms} ms`);
+    await sleepMs(50);
+  }
+}
+
+async function logsOf(agent, id, stream) {
+  const r = await agent.request(T.LOGS, encodeLogs(id, stream));
+  assert.equal(r.type, T.LOGS | T.REPLY, `logs reply was ${r.type}: ${r.payload}`);
+  return r.payload.toString('utf8');
+}
+
+test('spawn runs in the background: its output and exit code are kept', { skip }, async () => {
+  const a = new Agent();
+  const id = await spawnBg(a, ['/bin/sh', '-c', 'echo out-line; echo err-line >&2; exit 4']);
+  const s = await untilExited(a, id);
+  assert.equal(s.exitCode, 4);
+  assert.equal(await logsOf(a, id, 1), 'out-line\n');
+  assert.equal(await logsOf(a, id, 2), 'err-line\n');
+  await a.close();
+});
+
+test('stdin reaches a background program, and end of input ends it', { skip }, async () => {
+  const a = new Agent();
+  const id = await spawnBg(a, ['/bin/cat']);
+  const wrote = await a.request(T.STDIN, encodeProgram(id, Buffer.from('hello\n')));
+  assert.equal(wrote.type, T.STDIN | T.REPLY, `stdin reply was ${wrote.type}: ${wrote.payload}`);
+  const closed = await a.request(T.END_STDIN, encodeProgram(id));
+  assert.equal(closed.type, T.END_STDIN | T.REPLY);
+  const s = await untilExited(a, id);
+  assert.equal(s.exitCode, 0);
+  assert.equal(await logsOf(a, id, 1), 'hello\n');
+  const late = await a.request(T.STDIN, encodeProgram(id, Buffer.from('x')));
+  assert.equal(late.type, T.ERROR, 'stdin is closed once the program has exited');
+  await a.close();
+});
+
+test('kill sends the signal; the program then reports 128 + signal', { skip }, async () => {
+  const a = new Agent();
+  const id = await spawnBg(a, ['/bin/sleep', '30']);
+  const killed = await a.request(T.KILL, encodeKill(id, 15));
+  assert.equal(killed.type, T.KILL | T.REPLY, `kill reply was ${killed.type}: ${killed.payload}`);
+  const s = await untilExited(a, id);
+  assert.equal(s.exitCode, 128 + 15);
+  const again = await a.request(T.KILL, encodeKill(id, 15));
+  assert.equal(again.type, T.ERROR, 'a program that has exited cannot be signalled');
+  await a.close();
+});
+
+test('ps lists running and finished programs with their commands', { skip }, async () => {
+  const a = new Agent();
+  const run = await spawnBg(a, ['/bin/sleep', '30']);
+  const done = await spawnBg(a, ['/bin/true']);
+  await untilExited(a, done);
+  const r = await a.request(T.PS, Buffer.alloc(0));
+  assert.equal(r.type, T.PS | T.REPLY);
+  const list = decodePs(r.payload);
+  const mine = list.find((p) => p.id === run);
+  assert.equal(mine.running, true);
+  assert.equal(mine.command, '/bin/sleep 30');
+  const other = list.find((p) => p.id === done);
+  assert.equal(other.running, false);
+  assert.equal(other.exitCode, 0);
+  await a.request(T.KILL, encodeKill(run, 9));
+  await untilExited(a, run);
+  await a.close();
+});
+
+test('a program that cannot be run exits 127 and says why on stderr', { skip }, async () => {
+  const a = new Agent();
+  const id = await spawnBg(a, ['/no/such/program']);
+  const s = await untilExited(a, id);
+  assert.equal(s.exitCode, 127);
+  assert.match(await logsOf(a, id, 2), /cannot run/);
+  await a.close();
 });

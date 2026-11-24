@@ -60,6 +60,30 @@ describe('a VM guest', { skip: SKIP }, () => {
     assert.deepEqual(results.map((r) => r.stdout), ['n1\n', 'n2\n', 'n3\n']);
   });
 
+  test('a background program runs in the guest: stdin, logs, status, ps and kill', { timeout: 60000 }, async () => {
+    const guest = guests[0];
+    const waitExit = async (id) => {
+      for (let i = 0; i < 200; i++) {
+        const st = await guest.status(id);
+        if (!st.running) return st;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      throw new Error(`program ${id} did not exit`);
+    };
+    const cat = await guest.spawn(['/bin/busybox', 'cat']);
+    await guest.writeStdin(cat, 'through the guest\n');
+    await guest.endStdin(cat);
+    const st = await waitExit(cat);
+    assert.equal(st.exitCode, 0);
+    assert.equal(await guest.logs(cat), 'through the guest\n');
+    const sleeper = await guest.spawn(['/bin/busybox', 'sleep', '30']);
+    const listed = (await guest.ps()).find((p) => p.id === sleeper);
+    assert.equal(listed.running, true);
+    assert.equal(listed.command, '/bin/busybox sleep 30');
+    await guest.killProgram(sleeper, 15);
+    assert.equal((await waitExit(sleeper)).exitCode, 128 + 15);
+  });
+
   test('poweroff syncs, powers the guest off, and exits with status 0', { timeout: 60000 }, async () => {
     const guest = guests[0];
     const code = await guest.poweroff();
