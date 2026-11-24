@@ -8,9 +8,10 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
+import { Duplex } from 'node:stream';
 import {
   FrameDecoder, T, decodeExecResult, decodeHello, decodePorts, decodePs, decodeStatus, encodeExec, encodeFrame,
-  encodeHttp, encodeKill, encodeLogs, encodeProgram, encodeRead, encodeSpawn, encodeWrite,
+  encodeConnect, encodeHttp, encodeKill, encodeLogs, encodeProgram, encodeRead, encodeSpawn, encodeWrite,
 } from './guest-protocol.js';
 import {
   accelCandidates, buildQemuArgs, channelEndpoint, guestArchFor, vmInstalled, vmPaths,
@@ -83,6 +84,7 @@ export class Guest {
   #sock;
   #decoder = new FrameDecoder();
   #waiting = new Map(); // request id -> resolve(frame)
+  #streams = new Map(); // stream id -> the Duplex that carries it
   #nextId = 2; // id 1 is HELLO
   #tail = Promise.resolve(); // the request queue
   #stopped = false;
@@ -104,12 +106,23 @@ export class Guest {
         this.#exitCode = code;
         this.#stopped = true;
         this.#sock?.destroy();
+        // A stream cannot outlive its guest: end whatever is still open.
+        for (const s of this.#streams.values()) s.push(null);
+        this.#streams.clear();
         resolve(code);
       });
     });
     child.stderr?.on('data', (chunk) => { this.#stderr = (this.#stderr + chunk).slice(-4000); });
     sock.on('data', (chunk) => {
-      for (const frame of this.#decoder.push(chunk)) this.#waiting.get(frame.id)?.(frame);
+      for (const frame of this.#decoder.push(chunk)) {
+        // Stream frames are unsolicited, so they carry their stream's id, not a request's. Everything else answers a request.
+        if (frame.type === T.STREAM_DATA) this.#streams.get(frame.id)?.push(frame.payload);
+        else if (frame.type === T.STREAM_END) {
+          const s = this.#streams.get(frame.id);
+          this.#streams.delete(frame.id);
+          s?.push(null);
+        } else this.#waiting.get(frame.id)?.(frame);
+      }
     });
     sock.on('error', () => { /* the exit handler reports the stop */ });
   }
@@ -279,6 +292,39 @@ export class Guest {
     return this.#queued(async () => {
       const reply = await this.#ask(T.HTTP, encodeHttp({ port, timeoutMs, request }), timeoutMs + 5000);
       return parseHttpResponse(reply.payload);
+    });
+  }
+
+  /**
+   * Opens a TCP connection to a server inside the guest, on 127.0.0.1:port. Resolves to a duplex stream: write to send
+   * bytes to the server, read what it sends. ending or destroying the stream closes the connection in the guest. A
+   * refused connection rejects with ECONNREFUSED, as request() does.
+   */
+  connect(port) {
+    return this.#queued(async () => {
+      const reply = await this.#ask(T.CONNECT, encodeConnect(port), DEFAULT_REQUEST_MS);
+      const id = reply.payload.readUInt32LE(0);
+      const closeInGuest = async () => {
+        try {
+          await this.#ask(T.STREAM_CLOSE, encodeProgram(id), DEFAULT_REQUEST_MS);
+        } catch (err) {
+          // Already closed by the server: nothing left to close.
+          if (!/no such stream/.test(err.message)) throw err;
+        }
+      };
+      const stream = new Duplex({
+        read() {},
+        write: (chunk, _encoding, cb) => {
+          this.#ask(T.STREAM_WRITE, encodeProgram(id, chunk), DEFAULT_REQUEST_MS).then(() => cb(), cb);
+        },
+        final: (cb) => { closeInGuest().then(() => cb(), cb); },
+        destroy: (err, cb) => {
+          this.#streams.delete(id);
+          closeInGuest().then(() => cb(err), () => cb(err));
+        },
+      });
+      this.#streams.set(id, stream);
+      return stream;
     });
   }
 

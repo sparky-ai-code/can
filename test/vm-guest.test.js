@@ -105,6 +105,34 @@ describe('a VM guest', { skip: SKIP }, () => {
     }
   });
 
+  test('a raw stream reaches a server in the guest and carries its response to the host', { timeout: 60000 }, async () => {
+    const guest = guests[0];
+    await guest.exec(['/bin/busybox', 'mkdir', '-p', '/www']);
+    await guest.writeFile('/www/index.html', 'streamed hello\n');
+    const id = await guest.spawn(['/bin/busybox', 'httpd', '-f', '-p', '8081', '-h', '/www']);
+    try {
+      let stream = null;
+      for (let i = 0; i < 100 && !stream; i++) {
+        try {
+          stream = await guest.connect(8081);
+        } catch {
+          await new Promise((r) => setTimeout(r, 100)); // the server is still starting
+        }
+      }
+      assert.ok(stream, 'the stream opens');
+      const chunks = [];
+      stream.on('data', (c) => chunks.push(c));
+      const ended = new Promise((resolve) => stream.on('end', resolve));
+      stream.write('GET / HTTP/1.0\r\n\r\n');
+      await ended;
+      const text = Buffer.concat(chunks).toString('latin1');
+      assert.match(text, /^HTTP\/1\.[01] 200 /);
+      assert.match(text, /streamed hello/);
+    } finally {
+      await guest.killProgram(id, 9);
+    }
+  });
+
   test('poweroff syncs, powers the guest off, and exits with status 0', { timeout: 60000 }, async () => {
     const guest = guests[0];
     const code = await guest.poweroff();

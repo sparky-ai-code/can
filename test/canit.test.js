@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   FrameDecoder, T, decodeExecResult, decodeHello, decodePs, decodeStatus, encodeExec, encodeFrame, encodeKill,
-  encodeHttp, encodeLogs, encodeProgram, decodePorts, encodeRead, encodeSpawn, encodeWrite, OUTPUT_CAP,
+  encodeConnect, encodeHttp, encodeLogs, encodeProgram, decodePorts, encodeRead, encodeSpawn, encodeWrite, OUTPUT_CAP,
 } from '../src/vm/guest-protocol.js';
 
 const SOURCE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'distro', 'canit', 'canit.c');
@@ -319,3 +319,57 @@ test('ports lists a listening port; http reaches it; a refused connection is an 
     await a.close();
   }
 });
+
+// Raw streams: CONNECT opens a connection to a server in the guest, STREAM_WRITE sends bytes, the server's bytes come
+// back as STREAM_DATA frames, and STREAM_END marks the server's close. The raw client below reads stream frames by type,
+// since their ids are stream ids, not request ids.
+test('a raw stream connects to a server in the agent, carries a request and its response, and ends', { skip }, async () => {
+  let server = null;
+  const [prog, ...args] = linux(BIN, '--stdio');
+  const child = spawn(prog, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+  const dec = new FrameDecoder();
+  const replies = new Map();
+  const frames = [];
+  let nextId = 1;
+  child.stdin.on('error', () => {}); // the agent may exit first; that is a failed test, not a crash
+  child.stdout.on('data', (chunk) => {
+    for (const f of dec.push(chunk)) {
+      if (f.type === T.STREAM_DATA || f.type === T.STREAM_END) frames.push(f);
+      else replies.get(f.id)?.(f);
+    }
+  });
+  const ask = (type, payload) => new Promise((resolve) => {
+    const id = nextId++;
+    replies.set(id, resolve);
+    child.stdin.write(encodeFrame(type, id, payload));
+  });
+  try {
+    const port = 18082;
+    server = await spawnBgRaw(ask, ['python3', '-m', 'http.server', String(port), '--bind', '127.0.0.1'], '/tmp');
+    await sleepMs(1500); // the server needs a moment to start listening
+    let connected = null;
+    for (let i = 0; i < 100 && !connected; i++) {
+      const r = await ask(T.CONNECT, encodeConnect(port));
+      if (r.type === (T.CONNECT | T.REPLY)) connected = r.payload.readUInt32LE(0);
+      else await sleepMs(200);
+    }
+    assert.ok(connected, 'the connection opens');
+    const sent = await ask(T.STREAM_WRITE, encodeProgram(connected, Buffer.from('GET / HTTP/1.0\r\n\r\n')));
+    assert.equal(sent.type, T.STREAM_WRITE | T.REPLY, `write reply was ${sent.type}: ${sent.payload}`);
+    const end = Date.now() + 15000;
+    while (!frames.some((f) => f.type === T.STREAM_END && f.id === connected) && Date.now() < end) await sleepMs(50);
+    const data = Buffer.concat(frames.filter((f) => f.type === T.STREAM_DATA && f.id === connected).map((f) => f.payload));
+    assert.match(data.toString('latin1'), /^HTTP\/1\.0 200 /, `response: ${JSON.stringify(data.toString('latin1').slice(0, 200))} frames: ${JSON.stringify(frames.map((f) => [f.type, f.id, f.payload.length]))}`);
+    assert.ok(frames.some((f) => f.type === T.STREAM_END && f.id === connected), 'the server closed the stream');
+  } finally {
+    ask(T.KILL, encodeKill(server, 9)).catch(() => {});
+    child.stdin.end();
+    child.kill();
+  }
+});
+
+async function spawnBgRaw(ask, argv, cwd) {
+  const r = await ask(T.SPAWN, encodeSpawn({ argv, cwd }));
+  assert.equal(r.type, T.SPAWN | T.REPLY, `spawn reply was ${r.type}`);
+  return r.payload.readUInt32LE(0);
+}
