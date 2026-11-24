@@ -1,6 +1,6 @@
 // VM-backed cans: the methods the MCP tools use on a Can, served by one guest (src/vm/guest.js). Each method runs
 // inside the guest through the agent. Shapes match src/can.js, so a caller can use either. Methods the VM does not
-// provide yet (browser, screenshots, snapshots, mounts, environments) fail with ENOTSUP rather than doing nothing.
+// provide yet (mounts, environments, the host browser's file transfers) fail with ENOTSUP rather than doing nothing.
 //
 // Save and restore work by disk. Each can has its own writable disk: a qcow2 overlay on the read-only tools disk.
 // Its home folder is on that disk (/opt/can/home), so files survive. Save shuts the guest down cleanly; restore boots a
@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { startGuest } from './guest.js';
 import { vmPaths } from './qemu.js';
+import { VmChromium } from './vm-chromium.js';
 
 const HOME = '/opt/can/home';
 const SIGNALS = { SIGHUP: 1, SIGINT: 2, SIGKILL: 9, SIGUSR1: 10, SIGUSR2: 12, SIGTERM: 15 };
@@ -34,6 +35,7 @@ const shellQuote = (s) => `'${s.replace(/'/g, "'\\''")}'`;
 
 export class VmCan {
   #guest;
+  #chromium = null;
 
   constructor({
     id, name, guest, createdAt, overlay, browser = false, memMB = 256,
@@ -221,6 +223,14 @@ export class VmCan {
     return (await this.#guest.ports()).map((port) => ({ port, createdAt: null }));
   }
 
+  /**
+   * A raw TCP connection to a server in the guest, on 127.0.0.1:port: a duplex stream (write to send, read what it sends).
+   * Used for DevTools (src/vm/vm-chromium.js) and for raw streams (the stream opcodes in src/vm/guest.js).
+   */
+  connect(port) {
+    return this.#guest.connect(port);
+  }
+
   /** One HTTP request to a server in the guest. Resolves to {status, headers, body: Buffer}, as Can.request does. */
   request({
     port, method = 'GET', path: target = '/', headers = {}, body, timeout,
@@ -283,21 +293,53 @@ export class VmCan {
     return { disk: this.overlay, savedAt: new Date().toISOString() };
   }
 
+  // ---- the browser: Chromium runs in the guest; the page actions are the same ones a lite can has (src/vm/vm-chromium.js)
+
+  /** Sent to the MCP tools so they use this can's own browser (see ChromiumBrowsers.for in src/canchromium.js). */
+  get backend() { return 'vm'; }
+
+  /** The browser for this can, made on first use. A can without the browser disk refuses. */
+  #chromiumFor() {
+    if (!this.browser) throw notSupported('the browser (create the can with browser: true)');
+    this.#chromium ??= new VmChromium({ can: this });
+    return this.#chromium;
+  }
+
+  /** Runs a browser action (goto, snapshot, click, type, select, submit, text, query, back, evaluate, state, ...). */
+  async browse(action, ...args) {
+    return this.#chromiumFor().browse(action, ...args);
+  }
+
+  /** Runs a computer-use action (click, type, key, scroll, ...) in the browser. */
+  async computer(action, args) {
+    return this.#chromiumFor().computer(action, args);
+  }
+
+  /** A PNG of the active page, as a Buffer. opts: fullPage, width, height. */
+  async screenshot(opts) {
+    return Buffer.from(await this.#chromiumFor().browse('screenshot', opts), 'base64');
+  }
+
+  /** Closes this can's browser, if it has one. */
+  async #closeBrowser() {
+    const chromium = this.#chromium;
+    this.#chromium = null;
+    await chromium?.close();
+  }
+
   // ---- not on the VM yet
 
   openBrowser() { throw notSupported('the browser'); }
 
-  browse() { throw notSupported('the browser'); }
-
-  screenshot() { throw notSupported('screenshots'); }
-
   /** Shuts the guest down cleanly, so its disk is consistent. The can is then stopped. */
   async save() {
+    await this.#closeBrowser();
     await this.#guest.poweroff().catch(() => this.#guest.kill());
   }
 
   /** Powers the guest off. Its disk is kept until the manager destroys the can. */
   async destroy() {
+    await this.#closeBrowser();
     await this.#guest.poweroff().catch(() => this.#guest.kill());
   }
 }
