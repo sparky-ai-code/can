@@ -7,6 +7,7 @@ import { CanManager, defaultStoreDir } from './manager.js';
 import { KernelError } from './kernel/errors.js';
 import { environmentKey, normalizeEnvironment } from './environment.js';
 import { dropEntry, scanStore } from './store-index.js';
+import { VmCanManager } from './vm/vm-can.js';
 
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const STALE_AFTER_MS = 60 * 60 * 1000; // a leftover without a lock file is removed after this long
@@ -91,8 +92,24 @@ export class CanRegistry {
    * @param {string} [opts.storeDir] saved-state directory; defaults to $CAN_STORE_DIR, else ~/.can/cans
    * @param {boolean} [opts.layer2=true] false only for the layer-1-only test
    */
-  constructor({ storeDir = process.env.CAN_STORE_DIR || defaultStoreDir(), layer2 = true } = {}) {
+  /**
+   * @param {object} [opts]
+   * @param {'lite'|'vm'} [opts.backend] which backend new cans use; defaults to $CAN_BACKEND, else 'lite'. 'vm' keeps
+   *   each can on its own disk in the VM (see vm/vm-can.js); its saved state is kept under vmDir.
+   * @param {string} [opts.vmDir] the folder for VM cans; defaults to <storeDir>/vm
+   */
+  constructor({
+    storeDir = process.env.CAN_STORE_DIR || defaultStoreDir(),
+    layer2 = true,
+    backend = process.env.CAN_BACKEND || 'lite',
+    vmDir = path.join(process.env.CAN_STORE_DIR || defaultStoreDir(), 'vm'),
+  } = {}) {
+    if (backend !== 'lite' && backend !== 'vm') {
+      throw new KernelError('EINVAL', `EINVAL: backend is ${JSON.stringify(backend)}. Next: use "lite" or "vm".`);
+    }
     this.storeDir = storeDir;
+    this.backend = backend;
+    this.vm = backend === 'vm' ? new VmCanManager({ dir: vmDir }) : null;
     this.manager = new CanManager({ storeDir, layer2 });
     this._loading = new Map(); // can id -> Promise<Can>, so a saved can is never booted twice
     this._pending = new Set(); // names of cans being created
@@ -105,6 +122,11 @@ export class CanRegistry {
    * index has no current entry for it; see store-index.js): [{id, name, createdAt, specKey, tools, savedAt}].
    */
   saved() {
+    if (this.vm) {
+      return this.vm.index().filter((r) => !this.vm.get(r.id)).map(({ id, name, createdAt, savedAt }) => ({
+        id, name, createdAt, specKey: null, tools: [], savedAt,
+      }));
+    }
     return scanStore(this.storeDir).map(({ id, name, createdAt, specKey, tools, savedAt }) => ({
       id, name, createdAt, specKey, tools, savedAt,
     }));
@@ -112,6 +134,15 @@ export class CanRegistry {
 
   /** Every can the registry knows: live cans with their status, then saved cans that are not loaded. */
   list() {
+    if (this.vm) {
+      const liveRows = this.vm.list().map((c) => ({
+        id: c.id, name: c.name, status: c.status, createdAt: c.createdAt,
+      }));
+      const savedRows = this.saved().map((s) => ({
+        id: s.id, name: s.name, status: 'saved', createdAt: s.createdAt,
+      }));
+      return [...liveRows, ...savedRows];
+    }
     const live = this.manager.list();
     const liveIds = new Set(live.map((c) => c.id));
     const rows = live.map((c) => ({ id: c.id, name: c.name, status: c.status, createdAt: c.createdAt }));
@@ -124,6 +155,13 @@ export class CanRegistry {
   /** The live can for a name or id. A saved can is loaded into a new VM first. ENOENT if neither. */
   async get(ref) {
     if (typeof ref !== 'string' || ref === '') throw new KernelError('EINVAL', 'EINVAL: a can name or id is required. Next: pass the can name from can_list.');
+    if (this.vm) {
+      const vmLive = this.vm.get(ref);
+      if (vmLive) return vmLive;
+      const rec = this.vm.index().find((r) => r.id === ref || r.name === ref);
+      if (!rec) throw notFound(ref);
+      return this.vm.restore(rec.id);
+    }
     const live = this.manager.get(ref);
     if (live) return live;
     const entry = this._findSaved(ref);
@@ -146,6 +184,13 @@ export class CanRegistry {
    * Transactional: if any step fails, or the save fails, the VM is stopped, nothing is left on disk and the name is free.
    */
   async create(name, { mounts = [], environment } = {}) {
+    if (this.vm) {
+      const taken = this.vm.get(name) || this.vm.index().some((r) => r.name === name);
+      if (name !== undefined && name !== null && taken) {
+        throw new KernelError('EEXIST', `EEXIST: a can named "${name}" already exists. Next: use another name, or can_destroy it first.`);
+      }
+      return this.vm.create({ name: name ?? undefined, mounts, environment });
+    }
     const finalName = name === undefined || name === null ? this._autoName() : checkName(name);
     // The checks and the reservation run before the first await, so two creates cannot race.
     if (this.manager.get(finalName) || this._pending.has(finalName) || this.saved().some((s) => s.name === finalName)) {
@@ -175,6 +220,16 @@ export class CanRegistry {
    * only). A different spec is EEXIST. A name that is free is created. Returns {can, reused: false, state: 'running'}.
    */
   async ensure(name, { mounts = [], environment } = {}) {
+    if (this.vm && name !== undefined && name !== null) {
+      const live = this.vm.get(name);
+      const rec = live ? null : this.vm.index().find((r) => r.name === name);
+      if (live || rec) {
+        const can = live ?? (await this.vm.restore(rec.id));
+        return { can, reused: true, state: live ? 'running' : 'saved', id: can.id };
+      }
+      const can = await this.create(name, { mounts, environment });
+      return { can, reused: false, state: 'running', id: can.id };
+    }
     if (name !== undefined && name !== null) {
       const finalName = checkName(name);
       const key = environmentKey(normalizeEnvironment(environment), mounts);
@@ -206,6 +261,15 @@ export class CanRegistry {
    */
   async restart(ref) {
     if (typeof ref !== 'string' || ref === '') throw new KernelError('EINVAL', 'EINVAL: a can name or id is required. Next: pass the can name from can_list.');
+    if (this.vm) {
+      const live = this.vm.get(ref);
+      const rec = live ? { id: live.id, name: live.name, savedAt: null } : this.vm.index().find((r) => r.id === ref || r.name === ref);
+      if (!rec) throw notFound(ref);
+      const was = live ? live.status : 'saved';
+      if (live && live.status === 'running') await this.vm.save(live.id);
+      const can = await this.vm.restore(rec.id);
+      return { can, was, savedAt: this.vm.index().find((r) => r.id === rec.id)?.savedAt ?? null };
+    }
     const live = this.manager.get(ref);
     const entry = live ? { id: live.id, name: live.name } : this._findSaved(ref);
     if (!entry) throw notFound(ref);
@@ -227,6 +291,15 @@ export class CanRegistry {
    * `force` is set.
    */
   async save(ref, opts) {
+    if (this.vm) {
+      // A VM can's files are on its disk as they are written. Saving flushes them to the disk, and the can keeps running
+      // (stopping it is restart's job, see vm/vm-can.js save).
+      const live = this.vm.get(ref);
+      if (!live) throw notFound(ref);
+      const flushed = await live.exec('/bin/busybox sync');
+      if (flushed.exitCode !== 0) throw new KernelError('EIO', `EIO: could not flush can "${live.name}": ${flushed.stderr.trim()}`);
+      return this.vm.index().find((r) => r.id === live.id)?.overlay ?? null;
+    }
     const can = await this.get(ref);
     return this.manager.save(can.id, opts);
   }
@@ -243,6 +316,14 @@ export class CanRegistry {
 
   /** Stops the can and deletes its saved file. Returns the can's name. */
   async destroy(ref) {
+    if (this.vm) {
+      const vmCan = this.vm.get(ref) ?? this.vm.index().find((r) => r.id === ref || r.name === ref);
+      if (!vmCan) throw notFound(ref);
+      const name = vmCan.name;
+      await this.vm.destroy(vmCan.id);
+      this._errors.delete(vmCan.id);
+      return name;
+    }
     const live = this.manager.get(ref);
     if (live) {
       await this.manager.destroy(live.id);
@@ -308,6 +389,12 @@ export class CanRegistry {
    * Saved files are kept, so the cans load again next time. Processes die with their VM.
    */
   async shutdown({ save = true } = {}) {
+    if (this.vm) {
+      // Saving a VM can keeps its disk, so shutdown saves every running VM can.
+      if (save) await this.vm.shutdown();
+      else for (const c of this.vm.list()) if (c.status === 'running') await this.vm.destroy(c.id).catch(() => {});
+      return { saved: [], failed: [] };
+    }
     await Promise.allSettled([...this._loading.values()]);
     const result = save ? await this.saveAll() : { saved: [], failed: [] };
     await this.manager.stopAll();
