@@ -916,6 +916,13 @@ static void init_system(void) {
   mount_one("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC);
   mount_one("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV);
   mount_one("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV);
+  mount_one("tmpfs", "/dev/shm", "tmpfs", MS_NOSUID | MS_NODEV); /* Chrome keeps its shared memory here */
+  /* An optional browser disk (the second virtio-blk, vdb) holds Chrome and its libraries. It is read-only, and it is
+   * shared by every can that has it. */
+  if (access("/dev/vdb", F_OK) == 0) {
+    mkdir("/opt", 0755);
+    mount_one("/dev/vdb", "/opt/browser", "ext4", MS_RDONLY);
+  }
   /* An optional data disk (the first virtio-blk, vda) holds the tools for builds, mounted read-write at /opt/can.
    * A guest without the disk simply has no /opt/can. */
   if (access("/dev/vda", F_OK) == 0) {

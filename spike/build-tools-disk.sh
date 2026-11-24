@@ -10,7 +10,7 @@ NODE_DIR=${1:?usage: build-tools-disk.sh <node dir> <output image>}
 OUT=${2:?usage: build-tools-disk.sh <node dir> <output image>}
 MNT=/mnt/tools
 rm -f "$OUT"
-truncate -s 2G "$OUT"
+truncate -s "${3:-640M}" "$OUT"
 mkfs.ext4 -q -F "$OUT"
 mkdir -p "$MNT"
 mount -o loop "$OUT" "$MNT"
