@@ -16,6 +16,9 @@ import { DEFAULT_ENV } from './vm/seed.js';
 import { resolveMounts, defaultMountsFile } from './mounts.js';
 import { normalizeEnvironment, applyEnvironment, environmentKey } from './environment.js';
 import { dropEntry, recordEntry, writeAtomic } from './store-index.js';
+import { VmCanManager } from './vm/vm-can.js';
+
+const BACKENDS = ['lite', 'vm'];
 
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -42,10 +45,15 @@ export class CanManager {
    * @param {boolean} [opts.layer2=true] false only for the layer-1-only test (see test/vm.test.js)
    * @param {string} [opts.mountsFile] the host's allowlist of read-only mounts (see src/mounts.js)
    */
-  constructor({ storeDir = defaultStoreDir(), layer2 = true, mountsFile = defaultMountsFile() } = {}) {
+  constructor({
+    storeDir = defaultStoreDir(), layer2 = true, mountsFile = defaultMountsFile(), vmDir,
+  } = {}) {
     this.storeDir = storeDir;
     this.layer2 = layer2;
     this.mountsFile = mountsFile;
+    // Folder for the VM guests' channels and serial logs. Created on the first backend: 'vm' create (see vm/vm-can.js).
+    this.vmDir = vmDir ?? path.join(storeDir, 'vm');
+    this.vm = null;
     this.cans = new Map(); // id -> Can (live cans, including crashed ones until destroyed)
     this._names = new Set(); // names reserved by creates and loads still in progress
     this._autoCounter = 0;
@@ -58,7 +66,17 @@ export class CanManager {
    * can is returned. If any step fails the can is destroyed and the error is thrown. The result of the steps is
    * kept on can.report; the resolved toolchains are on can.toolchains.
    */
-  async create({ name, env = {}, mounts = [], environment } = {}) {
+  async create({
+    name, env = {}, mounts = [], environment, backend = 'lite',
+  } = {}) {
+    if (!BACKENDS.includes(backend)) {
+      throw new KernelError('EINVAL', `EINVAL: backend is ${JSON.stringify(backend)}. Next: use "lite" (the default) or "vm".`);
+    }
+    if (backend === 'vm') {
+      // The VM's own environment (CAN_QEMU, CAN_GUEST_DIR) comes from the process, not from the can's env.
+      this.vm ??= new VmCanManager({ dir: this.vmDir });
+      return this.vm.create({ name, mounts, environment });
+    }
     const finalName = name ?? this._autoName();
     if (typeof finalName !== 'string' || finalName === '') throw new TypeError('name must be a non-empty string');
     const spec = normalizeEnvironment(environment);
@@ -87,15 +105,19 @@ export class CanManager {
 
   /** Looks up a live can by id or name. Returns undefined if absent. */
   get(idOrName) {
-    return this.cans.get(idOrName) ?? [...this.cans.values()].find((c) => c.name === idOrName);
+    return this.cans.get(idOrName) ?? [...this.cans.values()].find((c) => c.name === idOrName) ?? this.vm?.get(idOrName);
   }
 
   list() {
-    return [...this.cans.values()];
+    return [...this.cans.values(), ...(this.vm?.list() ?? [])];
   }
 
   /** Stops the can's VM, removes it from memory and deletes its saved file, if any. */
   async destroy(idOrName) {
+    if (!this.cans.has(idOrName) && this.vm?.get(idOrName)) {
+      await this.vm.destroy(idOrName);
+      return;
+    }
     const can = this._require(idOrName);
     this.cans.delete(can.id);
     await can.destroy();
