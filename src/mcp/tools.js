@@ -1033,6 +1033,78 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
     ),
 
     tool(
+      'browser_links',
+      'List the links on the page as a JSON list of {text, href}. Each href is an absolute URL.',
+      { can: canProp },
+      ['can'],
+      async (a) => {
+        const can = await registry.get(a.can);
+        return block(JSON.stringify(await browserFor(can).browse('links'), null, 2));
+      },
+    ),
+
+    tool(
+      'browser_wait',
+      'Wait for a number of milliseconds (at most 60000) so that page scripts can finish, then return the page\'s url, title and status as JSON.',
+      { can: canProp, ms: { type: 'integer', minimum: 0, maximum: 60000, description: 'How long to wait, in milliseconds.' } },
+      ['can', 'ms'],
+      async (a) => {
+        const can = await registry.get(a.can);
+        return block(JSON.stringify(await browserFor(can).browse('wait', a.ms), null, 2));
+      },
+    ),
+
+    tool(
+      'browser_cookies',
+      'List the cookies in the can\'s browser as JSON: name, value, domain, path, secure, httpOnly and expires (ms, or null for a session cookie).',
+      { can: canProp },
+      ['can'],
+      async (a) => {
+        const can = await registry.get(a.can);
+        return block(JSON.stringify(await browserFor(can).browse('cookieList'), null, 2));
+      },
+    ),
+
+    tool(
+      'browser_new_tab',
+      'Open a new tab in the can\'s browser and make it the active tab. With a url, the tab loads it. Returns the tab list as JSON; tabs are numbered from 0.',
+      { can: canProp, url: { type: 'string', description: 'Optional http or https address to open in the new tab.' } },
+      ['can'],
+      async (a) => {
+        const can = await registry.get(a.can);
+        const s = await browserFor(can).browse('newTab', a.url);
+        await recordFrame(can);
+        return block(JSON.stringify(s, null, 2));
+      },
+    ),
+
+    tool(
+      'browser_select_tab',
+      'Make the tab with this index the active one. Returns the tab list as JSON.',
+      { can: canProp, index: { type: 'integer', minimum: 0, description: 'The tab number, from 0.' } },
+      ['can', 'index'],
+      async (a) => {
+        const can = await registry.get(a.can);
+        const s = await browserFor(can).browse('selectTab', a.index);
+        await recordFrame(can);
+        return block(JSON.stringify(s, null, 2));
+      },
+    ),
+
+    tool(
+      'browser_close_tab',
+      'Close a tab (the active one when no index is given). Closing the last tab opens a blank one. Returns the tab list as JSON.',
+      { can: canProp, index: { type: 'integer', minimum: 0, description: 'The tab number to close. Default: the active tab.' } },
+      ['can'],
+      async (a) => {
+        const can = await registry.get(a.can);
+        const s = await browserFor(can).browse('closeTab', a.index);
+        await recordFrame(can);
+        return block(JSON.stringify(s, null, 2));
+      },
+    ),
+
+    tool(
       'browser_back',
       'Go back one step in the active tab\'s history. Returns the page snapshot afterwards.',
       { can: canProp },

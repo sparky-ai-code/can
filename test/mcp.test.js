@@ -18,6 +18,7 @@ const EXPECTED_TOOLS = [
   'can_kill', 'can_read_file', 'can_write_file', 'can_list_dir', 'can_ports', 'can_http', 'can_import', 'can_export', 'can_ci',
   'browser_goto', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_select', 'browser_submit',
   'browser_text', 'browser_query', 'browser_back', 'browser_evaluate', 'browser_console', 'browser_screenshot',
+  'browser_links', 'browser_wait', 'browser_cookies', 'browser_new_tab', 'browser_select_tab', 'browser_close_tab',
   'can_record_start', 'can_record_stop', 'computer_screenshot', 'computer_action',
 ];
 

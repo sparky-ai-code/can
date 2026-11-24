@@ -9,13 +9,16 @@
 //           PrivateMemorySize64 every second, and enforced is 'sampled'.
 //   darwin  `ps -o rss=` every second (KiB). report(bytes) takes the child's own process.memoryUsage().rss; the
 //           larger of the two values is used.
-//   linux   /proc/<pid>/status VmRSS every second.
+//   linux   /proc/<pid>/status VmRSS every second. When cgroup v2 is writable here (src/vm/cgroup.js), the process
+//           also gets memory.max = limit in its own cgroup, and enforced is 'cgroup'. The kernel then holds the limit
+//           exactly; a kill by it is reported as a memory limit, not a crash.
 //
 // softBytes is informational here: the supervisor enforces the soft limit. onLimit fires at most once.
 import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { confineMemory } from './cgroup.js';
 
 const HELPER_SAMPLE_MS = 250;
 const SAMPLE_MS = 1000;
@@ -52,6 +55,7 @@ export function startMemoryMonitor(pid, { limitBytes, softBytes, onSample, onLim
   let helper = null;
   let sampler = null;
   let sampling = false;
+  let cgroup = null; // Linux only: the child's cgroup (see src/vm/cgroup.js)
 
   const fireLimit = () => {
     if (state.stopped || state.limitFired) return;
@@ -77,6 +81,8 @@ export function startMemoryMonitor(pid, { limitBytes, softBytes, onSample, onLim
     if (sampler && sampler.exitCode === null) sampler.kill();
     helper = null;
     sampler = null;
+    cgroup?.release();
+    cgroup = null;
   }
 
   // Timer or PowerShell fallback: one reading per tick, skipped while a previous reading is still running.
@@ -86,8 +92,13 @@ export function startMemoryMonitor(pid, { limitBytes, softBytes, onSample, onLim
       sampling = true;
       try {
         const bytes = await read();
-        if (bytes === null) stop(); // the process is gone
-        else emit(bytes);
+        if (bytes === null) {
+          // The process is gone. If the kernel killed it at memory.max, that was a memory limit, not a crash.
+          if (cgroup && cgroup.oomKills() > 0) fireLimit();
+          stop();
+        } else {
+          emit(bytes);
+        }
       } catch {
         // A failed reading is skipped; the next tick tries again.
       } finally {
@@ -188,7 +199,11 @@ export function startMemoryMonitor(pid, { limitBytes, softBytes, onSample, onLim
   function startPlatformSampler() {
     if (process.platform === 'win32') startPowerShellSampler();
     else if (process.platform === 'darwin') startTimer(readPs);
-    else startTimer(readProcStatus);
+    else {
+      cgroup = confineMemory(pid, { limitBytes });
+      if (cgroup) state.enforced = cgroup.enforced;
+      startTimer(readProcStatus);
+    }
   }
 
   process.once('exit', onParentExit);

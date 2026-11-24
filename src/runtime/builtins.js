@@ -10,6 +10,7 @@ import { startJsFile, checkSyntax, nodeVersionOf } from './js.js';
 import { asReadable, readAll, SyncInput } from './io.js';
 import { TEXT_BUILTINS, splitFlags } from './textcmds.js';
 import { UTIL_BUILTINS } from './utilcmds.js';
+import { ARCHIVE_BUILTINS } from './archive.js';
 import { SHELL_BUILTINS } from './shellcmds.js';
 import { STATUS_CODES } from './http.js';
 import { planTree, materialize, registryName, loadWorkspace } from './npm.js';
@@ -1015,7 +1016,7 @@ const CORE = {
 };
 
 /** Everything a can shell can run by name. */
-export const BUILTINS = Object.assign(Object.create(null), CORE, TEXT_BUILTINS, UTIL_BUILTINS, SHELL_BUILTINS);
+export const BUILTINS = Object.assign(Object.create(null), CORE, TEXT_BUILTINS, UTIL_BUILTINS, ARCHIVE_BUILTINS, SHELL_BUILTINS);
 
 function CORE_NAMES() {
   return new Set(Object.keys(BUILTINS));

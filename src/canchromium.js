@@ -6,8 +6,8 @@
 // through the proxy in src/canproxy.js, so http://localhost:<port>/ is the can's own server. Other hosts are reached
 // from the host (or refused, when the can has no internet). The can process itself is unchanged.
 //
-// Not supported yet: links, cookie and tab actions, waits, and WebSockets to the can (those go through the proxy,
-// which carries plain HTTP only). Unsupported actions fail with ENOTSUP.
+// Links, cookies, waits and tabs are supported, as in the built-in browser. Not supported yet: WebSockets to the
+// can (those go through the proxy, which carries plain HTTP only). Unsupported actions fail with ENOTSUP.
 import { HostBrowser, checkHostUrl, findBrowserExecutable } from './hostbrowser.js';
 import { startCanProxy } from './canproxy.js';
 import { canBrowserPage } from './chromium-page.js';
@@ -19,9 +19,12 @@ const WAIT_MS = 15_000;
 const START_MS = 300; // how long a click may take to start a navigation before we call it "no navigation"
 const MAX_LOG = 200;
 const SUPPORTED = new Set([
-  'goto', 'reload', 'back', 'forward', 'snapshot', 'text', 'html', 'query', 'click', 'submit', 'type', 'select',
-  'evaluate', 'state', 'clearConsole', 'screenshot',
+  'goto', 'reload', 'back', 'forward', 'wait', 'snapshot', 'text', 'html', 'links', 'query', 'click', 'submit', 'type',
+  'select', 'evaluate', 'state', 'clearConsole', 'screenshot', 'cookieList', 'newTab', 'selectTab', 'closeTab',
 ]);
+// The per-tab state. The active tab's values live on the driver itself; a tab's own copy is kept in its record.
+const TAB_FIELDS = ['session', 'mainFrameId', 'navCount', 'loadStarts', 'docStatus', 'docError', 'consoleLog'];
+const MAX_WAIT_MS = 60_000; // the built-in browser's cap on browse('wait')
 
 // Computer use (CanChromium.computer). Coordinates are CSS pixels of the viewport, which is the screenshot's size.
 const DEFAULT_VIEWPORT = Object.freeze({ width: 1280, height: 800 });
@@ -92,6 +95,14 @@ async function until(cond, ms) {
   }
 }
 
+/** A tab index that exists, or EINVAL (the same error as the built-in browser). */
+function tabIndex(index, count) {
+  if (!Number.isInteger(index) || index < 0 || index >= count) {
+    throw new KernelError('EINVAL', `EINVAL: no tab ${index}`);
+  }
+  return index;
+}
+
 export class CanChromium extends HostBrowser {
   /**
    * @param {object} opts
@@ -111,6 +122,8 @@ export class CanChromium extends HostBrowser {
     this.docError = null; // {code, url} when the proxy could not reach the can for that document
     this.consoleLog = [];
     this.viewport = null; // {width, height} that computer-use coordinates refer to (null: the default size)
+    this.tabs = []; // one record per open tab: {targetId, session, ...TAB_FIELDS}
+    this.activeTab = 0;
   }
 
   async _launch() {
@@ -118,6 +131,13 @@ export class CanChromium extends HostBrowser {
     this.canProxy = await startCanProxy({ canFor: this.canFor, internet: this.internet });
     this.proxyUrl = this.canProxy.url;
     await super._launch();
+    this.tabs = [this._tabRecord(this.targetId, this.session)];
+    this.activeTab = 0;
+    await this._setUpPage();
+  }
+
+  /** Per-page setup for the active tab: its frame, network events and the page API script. */
+  async _setUpPage() {
     const tree = await this._send('Page.getFrameTree');
     this.mainFrameId = tree.frameTree.frame.id;
     await this._send('Network.enable');
@@ -125,9 +145,42 @@ export class CanChromium extends HostBrowser {
     await this._eval(PAGE_SCRIPT);
   }
 
+  _tabRecord(targetId, session) {
+    return {
+      targetId, session, mainFrameId: null, navCount: 0, loadStarts: 0, docStatus: null, docError: null, consoleLog: [],
+    };
+  }
+
+  /** Copies the active tab's live state back into its record. */
+  _saveActive() {
+    const t = this.tabs[this.activeTab];
+    if (t) for (const f of TAB_FIELDS) t[f] = this[f];
+  }
+
+  /** Makes tab i the active one: its record's state becomes the driver's live state. */
+  _load(i) {
+    const t = this.tabs[i];
+    for (const f of TAB_FIELDS) this[f] = t[f];
+    this.activeTab = i;
+  }
+
+  _activate(i) {
+    this._saveActive();
+    this._load(i);
+  }
+
+  /** Events of every open tab are tracked. An event from a background tab updates that tab's own state. */
   _onMessage(msg) {
-    if (msg.method && msg.sessionId !== undefined && msg.sessionId === this.session) {
-      this._track(msg.method, msg.params ?? {});
+    if (msg.method && msg.sessionId !== undefined) {
+      const i = this.tabs.findIndex((t) => t.session === msg.sessionId);
+      if (i === this.activeTab) {
+        this._track(msg.method, msg.params ?? {});
+      } else if (i >= 0) {
+        const current = this.activeTab;
+        this._activate(i);
+        this._track(msg.method, msg.params ?? {});
+        this._activate(current);
+      }
     }
     super._onMessage(msg);
   }
@@ -183,10 +236,16 @@ export class CanChromium extends HostBrowser {
       case 'reload': return this._navigateBy(() => this._send('Page.reload'));
       case 'back': return this._history(-1);
       case 'forward': return this._history(1);
+      case 'wait': return this._wait(args[0]);
       case 'snapshot': return this._page('snapshot');
       case 'text': return this._page('text', args[0]);
       case 'html': return this._page('html', args[0]);
+      case 'links': return this._page('links');
       case 'query': return this._page('query', args[0]);
+      case 'cookieList': return this._cookieList();
+      case 'newTab': return this._newTab(args[0]);
+      case 'selectTab': return this._selectTab(args[0]);
+      case 'closeTab': return this._closeTab(args[0]);
       case 'click': return this._acting(() => this._page('click', args[0]));
       case 'submit': return this._acting(() => this._page('submit', args[0]));
       case 'type': return { value: await this._page('type', args[0], args[1]) };
@@ -296,6 +355,71 @@ export class CanChromium extends HostBrowser {
   async _state() {
     const s = await this._page('state');
     return { ...s, status: this.docStatus, consoleLog: this.consoleLog.slice() };
+  }
+
+  /** Sleeps for ms (at most 60 s, as the built-in browser does), then returns the page's summary. */
+  async _wait(ms = 0) {
+    await sleep(Math.max(0, Math.min(Number(ms) || 0, MAX_WAIT_MS)));
+    return this._pageSummary();
+  }
+
+  /** {url, title, status} of the active tab. */
+  async _pageSummary() {
+    const s = await this._state();
+    return { url: s.url, title: s.title, status: s.status };
+  }
+
+  /** The active tab's summary, with the list of tabs and which one is active. */
+  async _tabsSummary() {
+    return {
+      ...(await this._pageSummary()),
+      activeTab: this.activeTab,
+      tabs: this.tabs.map((t, index) => ({ index, active: index === this.activeTab })),
+    };
+  }
+
+  /** Cookies of the browser as {name, value, domain, path, secure, httpOnly, expires} (expires in ms, or null). */
+  async _cookieList() {
+    const { cookies } = await this._send('Network.getAllCookies');
+    return cookies.map((c) => ({
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      path: c.path,
+      secure: c.secure,
+      httpOnly: c.httpOnly,
+      expires: c.session || !(c.expires > 0) ? null : c.expires * 1000,
+    }));
+  }
+
+  /** Opens a new tab and makes it active. With a URL, it loads that URL there. */
+  async _newTab(url) {
+    this._saveActive();
+    const page = await this._attachNewPage();
+    this.tabs.push(this._tabRecord(page.targetId, page.sessionId));
+    this._load(this.tabs.length - 1);
+    await this._setUpPage();
+    if (url !== undefined) await this._goto(url);
+    return this._tabsSummary();
+  }
+
+  async _selectTab(index) {
+    this._activate(tabIndex(index, this.tabs.length));
+    return this._tabsSummary();
+  }
+
+  /** Closes a tab (the active one by default). Closing the last tab opens a blank one, as the built-in browser does. */
+  async _closeTab(index = this.activeTab) {
+    const i = tabIndex(index, this.tabs.length);
+    this._saveActive();
+    const [closed] = this.tabs.splice(i, 1);
+    await this._send('Target.closeTarget', { targetId: closed.targetId }, null);
+    if (this.tabs.length === 0) return this._newTab();
+    let next = this.activeTab;
+    if (i === this.activeTab) next = Math.min(i, this.tabs.length - 1);
+    else if (i < this.activeTab) next = this.activeTab - 1;
+    this._load(next);
+    return this._tabsSummary();
   }
 
   /**

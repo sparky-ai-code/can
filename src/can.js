@@ -91,7 +91,7 @@ export class Can {
   /**
    * Memory of this can, measured on its child process: {usedBytes, peakBytes, softBytes, limitBytes, enforced}.
    * limitBytes is 700 MB and softBytes 630 MB (1 MB = 1024 * 1024 bytes). enforced is 'job-object' when the Windows
-   * helper holds the hard limit, else 'sampled' (see src/vm/memcap.js).
+   * helper holds the hard limit, 'cgroup' when the Linux cgroup holds it, else 'sampled' (see src/vm/memcap.js).
    */
   memoryInfo() {
     return this._vm.memoryInfo();

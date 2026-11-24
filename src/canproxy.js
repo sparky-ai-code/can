@@ -102,7 +102,8 @@ function readBody(req) {
  * @returns {Promise<{url: string, close: () => Promise<void>}>}
  */
 export async function startCanProxy({ canFor, internet = true } = {}) {
-  const sockets = new Set();
+  const sockets = new Set(); // connections from the browser
+  const outbound = new Set(); // requests and tunnels the proxy opened to other hosts
 
   async function serveCan(req, res, target, body) {
     const can = canFor();
@@ -140,10 +141,14 @@ export async function startCanProxy({ canFor, internet = true } = {}) {
       method: req.method,
       headers: forwardHeaders(req.headers),
       lookup: pinnedLookup(addr),
+      // One connection per request. A kept-alive socket from the global agent would hold the host process open.
+      agent: false,
     }, (up) => {
       res.writeHead(up.statusCode ?? 502, responseHeaders(up.headers));
       up.pipe(res);
     });
+    outbound.add(upstream);
+    upstream.on('close', () => outbound.delete(upstream));
     upstream.on('error', (err) => failText(res, 502, `could not reach ${target.hostname}: ${err.code ?? err.message}`));
     upstream.end(body);
   }
@@ -186,6 +191,8 @@ export async function startCanProxy({ canFor, internet = true } = {}) {
       upstream.pipe(client);
       client.pipe(upstream);
     });
+    outbound.add(upstream);
+    upstream.on('close', () => outbound.delete(upstream));
     upstream.on('error', () => client.destroy());
     client.on('error', () => upstream.destroy());
   });
@@ -207,6 +214,7 @@ export async function startCanProxy({ canFor, internet = true } = {}) {
     url: `http://127.0.0.1:${port}`,
     close: () => new Promise((resolve) => {
       for (const s of sockets) s.destroy();
+      for (const o of outbound) o.destroy();
       server.close(() => resolve());
     }),
   };

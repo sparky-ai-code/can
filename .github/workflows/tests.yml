@@ -1,0 +1,33 @@
+name: Tests
+
+# The full suite on Windows and Linux, on Node 20 and 24. macOS has its own workflow (macos.yml). Chrome and Edge
+# are optional: the browser tests skip when neither is installed, and say so.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: node --test on ${{ matrix.os }} (Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        node: ['20', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Show versions
+        run: node --version
+
+      - name: Run the full test suite
+        run: node --test
