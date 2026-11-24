@@ -215,6 +215,22 @@ export class VmCan {
   }
 }
 
+/**
+ * Gives a guest outbound network access: QEMU's user networking hands the guest 10.0.2.15 behind the gateway 10.0.2.2,
+ * with DNS at 10.0.2.3. The guest's clock is set from the host, since the machine has no real-time clock. Without
+ * this the guest has no network; a can gets it only when it is created or restored with internet: true.
+ */
+async function bringUpNetwork(can) {
+  const r = await can.exec([
+    '/bin/busybox ip link set eth0 up',
+    '/bin/busybox ip addr add 10.0.2.15/24 dev eth0',
+    '/bin/busybox ip route add default via 10.0.2.2',
+    "echo 'nameserver 10.0.2.3' > /etc/resolv.conf",
+    `/bin/busybox date -s @${Math.floor(Date.now() / 1000)}`,
+  ].join(' && '));
+  if (r.exitCode !== 0) throw guestError('EIO', `the guest's network did not come up: ${r.stderr.trim()}`);
+}
+
 /** Reads the index of saved and running cans, or starts an empty one. */
 function readIndex(file) {
   try {
@@ -271,7 +287,7 @@ export class VmCanManager {
   }
 
   async #boot({
-    id, name, overlay, createdAt,
+    id, name, overlay, createdAt, internet = false,
   }) {
     const guest = await startGuest({
       name: `can-${id.slice(0, 12)}`,
@@ -279,6 +295,7 @@ export class VmCanManager {
       memMB: this.#memMB,
       env: this.#env,
       disks: [{ file: overlay, format: 'qcow2' }],
+      internet,
     });
     return new VmCan({
       id, name, guest, createdAt, overlay,
@@ -289,7 +306,9 @@ export class VmCanManager {
    * Starts a guest on a new disk and returns its can. Mounts and environments are not on the VM yet, so they are
    * refused.
    */
-  async create({ name, mounts = [], environment } = {}) {
+  async create({
+    name, mounts = [], environment, internet = false,
+  } = {}) {
     if (mounts.length > 0) throw notSupported('mounts');
     if (environment !== undefined) throw notSupported('environments');
     const finalName = name ?? `can-${++this.#counter}`;
@@ -307,11 +326,12 @@ export class VmCanManager {
     makeOverlay(paths, overlay);
     const createdAt = Date.now();
     const can = await this.#boot({
-      id, name: finalName, overlay, createdAt,
+      id, name: finalName, overlay, createdAt, internet,
     });
+    if (internet) await bringUpNetwork(can);
     await can.mkdir(HOME, { recursive: true });
     this.#index.push({
-      id, name: finalName, overlay, createdAt, savedAt: null,
+      id, name: finalName, overlay, createdAt, savedAt: null, internet,
     });
     this.#writeIndex();
     this.#cans.set(id, can);
@@ -336,6 +356,7 @@ export class VmCanManager {
     const running = this.#cans.get(record.id);
     if (running?.status === 'running') throw guestError('EEXIST', `can ${record.name} is already running`);
     const can = await this.#boot(record);
+    if (record.internet) await bringUpNetwork(can);
     this.#cans.set(record.id, can);
     return can;
   }
