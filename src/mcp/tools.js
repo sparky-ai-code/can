@@ -350,10 +350,17 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
           },
         },
         environment: ENVIRONMENT_SCHEMA,
+        browser: {
+          type: 'boolean',
+          description: 'VM cans only: start Chromium in the can, for the browser_* tools. It needs the browser disk and '
+            + 'at least 1792 MB of memory. Lite cans always have a browser. Default: false.',
+        },
       },
       [],
       async (a) => {
-        const r = await registry.ensure(a.name, { mounts: a.mounts ?? [], environment: a.environment });
+        const r = await registry.ensure(a.name, {
+          mounts: a.mounts ?? [], environment: a.environment, browser: a.browser === true,
+        });
         if (r.reused) {
           if (r.state === 'running') return `can "${a.name}" already exists with the same spec; reused (id ${r.id}, state ready).`;
           return `can "${a.name}" already exists with the same spec; not running (state: ${r.state}). `

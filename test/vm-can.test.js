@@ -79,7 +79,6 @@ describe('a VM can', { skip: SKIP }, () => {
 
   test('what the VM does not provide yet fails with ENOTSUP, not silently', () => {
     assert.throws(() => web.openBrowser(), (err) => err.code === 'ENOTSUP');
-    assert.throws(() => web.screenshot(), (err) => err.code === 'ENOTSUP');
   });
 
   test('the manager finds a can by name, and destroy powers its guest off', { timeout: 60000 }, async () => {

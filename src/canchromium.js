@@ -14,7 +14,7 @@ import { canBrowserPage } from './chromium-page.js';
 import { KernelError } from './kernel/errors.js';
 
 // Chrome runs this in every new document. The guard inside makes a second run a no-op.
-const PAGE_SCRIPT = `(${canBrowserPage.toString()})();`;
+export const PAGE_SCRIPT = `(${canBrowserPage.toString()})();`;
 const WAIT_MS = 15_000;
 const START_MS = 300; // how long a click may take to start a navigation before we call it "no navigation"
 const MAX_LOG = 200;
@@ -583,6 +583,8 @@ export class ChromiumBrowsers {
   }
 
   for(can) {
+    // A VM can runs its own browser inside the guest (src/vm/vm-chromium.js); its methods have the same shapes.
+    if (can.backend === 'vm') return can;
     let entry = this.entries.get(can.id);
     if (!entry) {
       entry = { can, chromium: null };
