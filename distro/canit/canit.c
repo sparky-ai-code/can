@@ -25,6 +25,11 @@
  *   HTTP  0x51   u32le port | u32le timeoutMs | the raw request  -> the raw response. The request goes to
  *                127.0.0.1:port, and the response is read until the server closes the connection (so the request
  *                should say Connection: close). A refused connection, or no response within the timeout, is an ERROR.
+ *   CONNECT 0x60  u32le port  -> u32le stream id. Opens a TCP connection to 127.0.0.1:port inside the guest.
+ *   STREAM_WRITE 0x61  u32le id | data  -> empty. Writes to the stream.
+ *   STREAM_CLOSE 0x63  u32le id  -> empty. Closes the stream from the host's side.
+ *   STREAM_DATA 0x70  (agent to host, unsolicited)  id = the stream; payload = bytes the server sent.
+ *   STREAM_END 0x71   (agent to host, unsolicited)  id = the stream; the server closed it, or it failed.
  * Background programs share the agent with exec. At most 64 at once. While an EXEC runs, background output waits in
  * its pipes, so a program that writes a lot then blocks until the next request is served.
  *
@@ -68,6 +73,7 @@ enum {
   T_HELLO = 0x01, T_PING = 0x02, T_EXEC = 0x10, T_POWEROFF = 0x20, T_WRITE = 0x30, T_READ = 0x31,
   T_SPAWN = 0x40, T_LOGS = 0x41, T_STATUS = 0x42, T_KILL = 0x43, T_PS = 0x44, T_STDIN = 0x45, T_END_STDIN = 0x46,
   T_PORTS = 0x50, T_HTTP = 0x51,
+  T_CONNECT = 0x60, T_STREAM_WRITE = 0x61, T_STREAM_CLOSE = 0x63, T_STREAM_DATA = 0x70, T_STREAM_END = 0x71,
   T_REPLY = 0x80, T_ERROR = 0xff
 };
 
@@ -681,6 +687,103 @@ static void do_http(uint32_t id, const uint8_t *payload, uint32_t len) {
   free(resp.data);
 }
 
+/* ---- raw streams: a TCP connection to a server in the guest, relayed to the host ---- */
+
+#define MAX_STREAMS 64
+
+typedef struct {
+  uint32_t id; /* 0 = a free slot */
+  int fd;      /* -1 when closed */
+} stream_t;
+
+static stream_t streams[MAX_STREAMS];
+static uint32_t stream_next_id = 1;
+
+static stream_t *stream_find(uint32_t id) {
+  for (size_t i = 0; i < MAX_STREAMS; i++) if (streams[i].id && streams[i].id == id) return &streams[i];
+  return NULL;
+}
+
+static void stream_forget(stream_t *s) {
+  if (s->fd >= 0) close(s->fd);
+  s->fd = -1;
+  s->id = 0;
+}
+
+/* CONNECT: u32le port -> u32le stream id. The connection to 127.0.0.1 gets a 5 second limit. */
+static void do_connect(uint32_t id, const uint8_t *payload, uint32_t len) {
+  if (len != 4) { send_error(id, "connect: the request is a port"); return; }
+  uint32_t port = get_u32(payload);
+  if (port == 0 || port > 65535) { send_error(id, "connect: the port must be 1 to 65535"); return; }
+  stream_t *slot = NULL;
+  for (size_t i = 0; i < MAX_STREAMS; i++) if (streams[i].id == 0) { slot = &streams[i]; break; }
+  if (!slot) { send_error(id, "connect: too many streams (limit 64)"); return; }
+  int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (s < 0) {
+    char msg[256];
+    snprintf(msg, sizeof msg, "connect: socket: %s", strerror(errno));
+    send_error(id, msg);
+    return;
+  }
+  struct timeval tv = {5, 0};
+  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+  struct sockaddr_in sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sin_family = AF_INET;
+  sa.sin_port = htons((uint16_t)port);
+  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(s, (struct sockaddr *)&sa, sizeof sa) < 0) {
+    char msg[256];
+    snprintf(msg, sizeof msg, "connect 127.0.0.1:%u: %s", port, strerror(errno));
+    close(s);
+    send_error(id, msg);
+    return;
+  }
+  slot->id = stream_next_id++;
+  slot->fd = s;
+  uint8_t b[4];
+  put_u32(b, slot->id);
+  send_frame(T_CONNECT | T_REPLY, id, b, 4);
+}
+
+static void do_stream_write(uint32_t id, const uint8_t *payload, uint32_t len) {
+  if (len < 4) { send_error(id, "stream write: the request is a stream id and data"); return; }
+  stream_t *s = stream_find(get_u32(payload));
+  if (!s || s->fd < 0) { send_error(id, "stream write: no such stream"); return; }
+  if (write_full(s->fd, payload + 4, len - 4) < 0) {
+    char msg[256];
+    snprintf(msg, sizeof msg, "stream write: %s", strerror(errno));
+    send_error(id, msg);
+    return;
+  }
+  send_frame(T_STREAM_WRITE | T_REPLY, id, NULL, 0);
+}
+
+static void do_stream_close(uint32_t id, const uint8_t *payload, uint32_t len) {
+  if (len != 4) { send_error(id, "stream close: the request is a stream id"); return; }
+  stream_t *s = stream_find(get_u32(payload));
+  if (!s) { send_error(id, "stream close: no such stream"); return; }
+  stream_forget(s);
+  send_frame(T_STREAM_CLOSE | T_REPLY, id, NULL, 0);
+}
+
+/* Reads what a server sent on one stream and passes it to the host. End of file ends the stream. */
+static void stream_drain(int fd) {
+  for (size_t i = 0; i < MAX_STREAMS; i++) {
+    if (streams[i].id == 0 || streams[i].fd != fd) continue;
+    uint8_t chunk[16384];
+    ssize_t n = read(fd, chunk, sizeof chunk);
+    if (n > 0) {
+      send_frame(T_STREAM_DATA, streams[i].id, chunk, (uint32_t)n);
+      return;
+    }
+    if (n < 0 && (errno == EINTR || errno == EAGAIN)) return;
+    send_frame(T_STREAM_END, streams[i].id, NULL, 0);
+    stream_forget(&streams[i]);
+    return;
+  }
+}
+
 static void power_off(void) {
   sync();
   if (is_init) { reboot(RB_POWER_OFF); for (;;) pause(); }
@@ -691,7 +794,7 @@ static void serve(void) {
   for (;;) {
     /* Watch the host's channel and every background program's output, so that a program never blocks on a full pipe
      * while the host is idle. The timeout also reaps children that have ended. */
-    struct pollfd pfds[1 + 2 * MAX_BG];
+    struct pollfd pfds[1 + 2 * MAX_BG + MAX_STREAMS];
     nfds_t n = 0;
     pfds[n++] = (struct pollfd){in_fd, POLLIN, 0};
     for (size_t i = 0; i < MAX_BG; i++) {
@@ -699,12 +802,18 @@ static void serve(void) {
       if (bg[i].out_fd >= 0) pfds[n++] = (struct pollfd){bg[i].out_fd, POLLIN, 0};
       if (bg[i].err_fd >= 0) pfds[n++] = (struct pollfd){bg[i].err_fd, POLLIN, 0};
     }
+    for (size_t i = 0; i < MAX_STREAMS; i++) {
+      if (streams[i].id && streams[i].fd >= 0) pfds[n++] = (struct pollfd){streams[i].fd, POLLIN, 0};
+    }
     int r = poll(pfds, n, 200);
     reap_children();
     if (r < 0 && errno == EINTR) continue;
     if (r < 0) { usleep(10000); continue; }
     for (nfds_t k = 1; k < n; k++) {
-      if (pfds[k].revents & (POLLIN | POLLHUP | POLLERR)) bg_drain(pfds[k].fd);
+      if (pfds[k].revents & (POLLIN | POLLHUP | POLLERR)) {
+        bg_drain(pfds[k].fd);
+        stream_drain(pfds[k].fd);
+      }
     }
     if (!(pfds[0].revents & (POLLIN | POLLHUP | POLLERR))) continue;
     uint8_t head[4];
@@ -741,6 +850,9 @@ static void serve(void) {
       case T_END_STDIN: do_end_stdin(id, payload, plen); break;
       case T_PORTS: do_ports(id); break;
       case T_HTTP: do_http(id, payload, plen); break;
+      case T_CONNECT: do_connect(id, payload, plen); break;
+      case T_STREAM_WRITE: do_stream_write(id, payload, plen); break;
+      case T_STREAM_CLOSE: do_stream_close(id, payload, plen); break;
       case T_POWEROFF: send_frame(T_POWEROFF | T_REPLY, id, NULL, 0); free(body); power_off(); return;
       default: {
         char msg[64];

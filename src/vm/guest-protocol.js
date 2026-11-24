@@ -40,6 +40,11 @@ export const T = Object.freeze({
   END_STDIN: 0x46,
   PORTS: 0x50,
   HTTP: 0x51,
+  CONNECT: 0x60,
+  STREAM_WRITE: 0x61,
+  STREAM_CLOSE: 0x63,
+  STREAM_DATA: 0x70,
+  STREAM_END: 0x71,
   REPLY: 0x80,
   ERROR: 0xff,
 });
@@ -169,6 +174,14 @@ export function decodePs(payload) {
 }
 
 /** An HTTP request: the port, how long to wait for the response, and the raw request bytes. */
+/** A CONNECT request: the port of the server, on 127.0.0.1 inside the guest. The reply payload is the stream id. */
+export function encodeConnect(port) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw protoError(`port ${port} is not 1 to 65535`);
+  const b = Buffer.alloc(4);
+  b.writeUInt32LE(port, 0);
+  return b;
+}
+
 export function encodeHttp({ port, timeoutMs = 30000, request }) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw protoError(`port ${port} is not 1 to 65535`);
   const head = Buffer.alloc(8);
