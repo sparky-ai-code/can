@@ -29,17 +29,54 @@ function notSupported(what) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** One shell word: wrapped in single quotes, with each single quote written as '\'' . */
+const shellQuote = (s) => `'${s.replace(/'/g, "'\\''")}'`;
+
 export class VmCan {
   #guest;
 
   constructor({
-    id, name, guest, createdAt, overlay,
+    id, name, guest, createdAt, overlay, browser = false,
   }) {
     this.id = id;
     this.name = name;
     this.createdAt = createdAt;
     this.overlay = overlay;
+    this.browser = browser;
     this.#guest = guest;
+  }
+
+  /**
+   * Runs headless Chromium in the guest on a URL, and returns what it produced. The URL can be a data: page, or a server
+   * in the guest (http://localhost:<port>/). The browser runs once per call; nothing stays open. Needs a can created with
+   * browser: true.
+   */
+  async #chrome(url, extra) {
+    if (!this.browser) throw notSupported('the browser (create the can with browser: true)');
+    const flags = [
+      'FONTCONFIG_FILE=/opt/browser/fonts.conf', 'LD_LIBRARY_PATH=/opt/browser/lib', '/opt/browser/chrome/chrome',
+      '--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
+      `--user-data-dir=/tmp/browser-profile-${randomUUID()}`, ...extra,
+      shellQuote(String(url)),
+    ];
+    return this.exec(flags.join(' '), { timeoutMs: 90000 });
+  }
+
+  /** The DOM of a page after its scripts have run, as HTML. */
+  async browserDom(url) {
+    const r = await this.#chrome(url, ['--dump-dom']);
+    if (r.exitCode !== 0) throw guestError('EIO', `the browser failed (exit ${r.exitCode}): ${r.stderr.split('\n').filter((l) => !l.includes('dbus')).slice(-3).join(' ').trim()}`);
+    return r.stdout;
+  }
+
+  /** A PNG of a page, width by height pixels (default 800 by 600). Returns a Buffer. */
+  async browserScreenshot(url, { width = 800, height = 600 } = {}) {
+    const file = `/tmp/shot-${randomUUID()}.png`;
+    const r = await this.#chrome(url, [`--window-size=${width},${height}`, `--screenshot=${file}`]);
+    if (r.exitCode !== 0) throw guestError('EIO', `the browser failed (exit ${r.exitCode}): ${r.stderr.split('\n').filter((l) => !l.includes('dbus')).slice(-3).join(' ').trim()}`);
+    const png = await this.readFile(file);
+    await this.rm(file, { force: true });
+    return png;
   }
 
   /** 'running' while the guest runs, 'stopped' after it has powered off. */
@@ -149,7 +186,8 @@ export class VmCan {
 
   /** Runs a busybox applet in the guest and returns its result. */
   #applet(argv) {
-    return this.#guest.exec(['/bin/busybox', ...argv], { cwd: HOME, timeoutMs: 30000 });
+    // Run from /, not from the home folder: mkdir -p makes the home folder, so it may not exist yet.
+    return this.#guest.exec(['/bin/busybox', ...argv], { cwd: '/', timeoutMs: 30000 });
   }
 
   async mkdir(dir, options = {}) {
@@ -227,7 +265,7 @@ async function bringUpNetwork(can) {
     '/bin/busybox ip route add default via 10.0.2.2',
     "echo 'nameserver 10.0.2.3' > /etc/resolv.conf",
     `/bin/busybox date -s @${Math.floor(Date.now() / 1000)}`,
-  ].join(' && '));
+  ].join(' && '), { cwd: '/' });
   if (r.exitCode !== 0) throw guestError('EIO', `the guest's network did not come up: ${r.stderr.trim()}`);
 }
 
@@ -287,18 +325,23 @@ export class VmCanManager {
   }
 
   async #boot({
-    id, name, overlay, createdAt, internet = false,
+    id, name, overlay, createdAt, internet = false, browser = false,
   }) {
+    // The can's own disk is the first virtio-blk (vda). The browser disk, when there is one, is the second, shared
+    // read-only by every browser can.
+    const disks = [{ file: overlay, format: 'qcow2' }];
+    if (browser) disks.push({ file: vmPaths({ env: this.#env }).browser, readonly: true });
+    // Chrome needs about 1.8 GB; with less it swaps itself into a timeout. Browser cans get at least that much.
     const guest = await startGuest({
       name: `can-${id.slice(0, 12)}`,
       dir: this.#dir,
-      memMB: this.#memMB,
+      memMB: browser ? Math.max(this.#memMB, 1792) : this.#memMB,
       env: this.#env,
-      disks: [{ file: overlay, format: 'qcow2' }],
+      disks,
       internet,
     });
     return new VmCan({
-      id, name, guest, createdAt, overlay,
+      id, name, guest, createdAt, overlay, browser,
     });
   }
 
@@ -307,10 +350,13 @@ export class VmCanManager {
    * refused.
    */
   async create({
-    name, mounts = [], environment, internet = false,
+    name, mounts = [], environment, internet = false, browser = false,
   } = {}) {
     if (mounts.length > 0) throw notSupported('mounts');
     if (environment !== undefined) throw notSupported('environments');
+    if (browser && !fs.existsSync(vmPaths({ env: this.#env }).browser)) {
+      throw guestError('ENOENT', 'the browser disk is missing. Next: set CAN_BROWSER_DISK, or build it with spike/build-browser-disk.sh');
+    }
     const finalName = name ?? `can-${++this.#counter}`;
     if (!NAME.test(finalName)) throw guestError('EINVAL', 'a can name is 1 to 40 letters, digits, - or _');
     for (const c of this.#cans.values()) if (c.name === finalName) throw guestError('EEXIST', `a can named ${finalName} exists`);
@@ -326,12 +372,12 @@ export class VmCanManager {
     makeOverlay(paths, overlay);
     const createdAt = Date.now();
     const can = await this.#boot({
-      id, name: finalName, overlay, createdAt, internet,
+      id, name: finalName, overlay, createdAt, internet, browser,
     });
     if (internet) await bringUpNetwork(can);
     await can.mkdir(HOME, { recursive: true });
     this.#index.push({
-      id, name: finalName, overlay, createdAt, savedAt: null, internet,
+      id, name: finalName, overlay, createdAt, savedAt: null, internet, browser,
     });
     this.#writeIndex();
     this.#cans.set(id, can);

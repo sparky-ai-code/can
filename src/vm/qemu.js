@@ -53,6 +53,7 @@ export function vmPaths({ platform = process.platform, arch = guestArchFor(platf
     shareDir: path.join(appRoot, 'vmm', 'share'),
     qemuImg: env.CAN_QEMU_IMG ?? path.join(path.dirname(env.CAN_QEMU ?? path.join(appRoot, 'vmm', 'x')), `qemu-img${exe}`),
     tools: env.CAN_TOOLS_DISK ?? path.join(guestDir, 'tools.img'),
+    browser: env.CAN_BROWSER_DISK ?? path.join(guestDir, 'browser.img'),
     kernel: path.join(guestDir, arch, 'vmlinuz'),
     initrd: path.join(guestDir, arch, 'initrd.img'),
   };
