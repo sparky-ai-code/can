@@ -370,14 +370,24 @@ export class VmCanManager {
     return [...this.#cans.values()];
   }
 
-  /** Powers the guest off, and deletes the can and its disk. */
+  /** The records of every can with a disk: {id, name, overlay, createdAt, savedAt, internet}, saved or running. */
+  index() {
+    return this.#index.map((r) => ({ ...r }));
+  }
+
+  /** Powers the guest off if it runs, and deletes the can and its disk. A saved can (stopped, not loaded) can be
+   * destroyed too. */
   async destroy(idOrName) {
     const can = this.get(idOrName);
-    if (!can) throw guestError('ENOENT', `no can named ${idOrName}`);
-    this.#cans.delete(can.id);
-    await can.destroy();
-    fs.rmSync(can.overlay, { force: true });
-    this.#index = this.#index.filter((r) => r.id !== can.id);
+    const record = this.#index.find((r) => r.id === (can?.id ?? idOrName) || r.name === idOrName);
+    if (!can && !record) throw guestError('ENOENT', `no can named ${idOrName}`);
+    const id = can?.id ?? record.id;
+    if (can) {
+      this.#cans.delete(id);
+      await can.destroy();
+    }
+    fs.rmSync(can?.overlay ?? record.overlay, { force: true });
+    this.#index = this.#index.filter((r) => r.id !== id);
     this.#writeIndex();
   }
 

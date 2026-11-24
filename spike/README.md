@@ -104,3 +104,13 @@ Processes, ports and the agent's state do not survive a save. `can_restart` in t
 
 QMP is also set up as `-object monitor-qmp`, which works over a named pipe. But one QEMU quirk matters here: `-monitor
 none` makes QEMU exit as soon as a monitor object is added, so the builder leaves it out when QMP is set.
+
+## The MCP tools on the VM backend
+
+Set `CAN_BACKEND=vm` for the MCP server (or `new CanRegistry({ backend: 'vm' })`). New cans are VM cans, one guest on
+its own disk, under `<store>/vm` (or `vmDir`). The tools run in them: can_create, can_exec, can_write_file,
+can_read_file, can_list, can_destroy, and the rest that a VM can provides (see `src/vm/vm-can.js`). A tool a VM can
+does not provide yet (the browser, screenshots, snapshots, stat, setCwd, memory accounting) fails with ENOTSUP.
+
+`can_exec` saves after a command. On the VM backend a save flushes the disk with `sync`, and the can keeps running;
+restart is what stops and starts a can.
