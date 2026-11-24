@@ -21,6 +21,10 @@
  *   PS    0x44   -> u32le count, then per program: u32le id | u8 running | i32le code | u32le len | command.
  *   STDIN 0x45   u32le id | data  -> empty. Writes to the program's stdin; blocks while the program is not reading.
  *   END_STDIN 0x46  u32le id  -> empty. Closes the program's stdin, so it sees end of input.
+ *   PORTS 0x50   -> u32le count, then u32le per port listening on TCP (IPv4 or IPv6) in the guest.
+ *   HTTP  0x51   u32le port | u32le timeoutMs | the raw request  -> the raw response. The request goes to
+ *                127.0.0.1:port, and the response is read until the server closes the connection (so the request
+ *                should say Connection: close). A refused connection, or no response within the timeout, is an ERROR.
  * Background programs share the agent with exec. At most 64 at once. While an EXEC runs, background output waits in
  * its pipes, so a program that writes a lot then blocks until the next request is served.
  *
@@ -31,7 +35,9 @@
  * The PID 1 path can only be tested by booting a guest; --stdio is tested on any Linux.
  */
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <dirent.h>
+#include <netinet/in.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
@@ -45,6 +51,7 @@
 #include <sys/mount.h>
 #include <sys/reboot.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
@@ -60,6 +67,7 @@
 enum {
   T_HELLO = 0x01, T_PING = 0x02, T_EXEC = 0x10, T_POWEROFF = 0x20, T_WRITE = 0x30, T_READ = 0x31,
   T_SPAWN = 0x40, T_LOGS = 0x41, T_STATUS = 0x42, T_KILL = 0x43, T_PS = 0x44, T_STDIN = 0x45, T_END_STDIN = 0x46,
+  T_PORTS = 0x50, T_HTTP = 0x51,
   T_REPLY = 0x80, T_ERROR = 0xff
 };
 
@@ -541,6 +549,138 @@ static void do_end_stdin(uint32_t id, const uint8_t *payload, uint32_t len) {
   send_frame(T_END_STDIN | T_REPLY, id, NULL, 0);
 }
 
+/* ---- ports and HTTP ---- */
+
+/* Adds each port in a /proc/net/tcp-style table that is in the LISTEN state (0x0A) to the list, once. */
+static void add_listening(const char *path, uint32_t **ports, size_t *count, size_t *cap) {
+  FILE *f = fopen(path, "r");
+  if (!f) return;
+  char line[512];
+  if (!fgets(line, sizeof line, f)) { fclose(f); return; }
+  while (fgets(line, sizeof line, f)) {
+    char local[128], remote[128];
+    unsigned state = 0;
+    if (sscanf(line, " %*d: %127s %127s %x", local, remote, &state) != 3) continue;
+    if (state != 0x0A) continue;
+    const char *colon = strrchr(local, ':');
+    if (!colon) continue;
+    uint32_t port = (uint32_t)strtoul(colon + 1, NULL, 16);
+    int seen = 0;
+    for (size_t i = 0; i < *count; i++) if ((*ports)[i] == port) seen = 1;
+    if (seen) continue;
+    if (*count == *cap) {
+      size_t next = *cap ? *cap * 2 : 16;
+      uint32_t *grown = realloc(*ports, next * sizeof **ports);
+      if (!grown) break;
+      *ports = grown;
+      *cap = next;
+    }
+    (*ports)[(*count)++] = port;
+  }
+  fclose(f);
+}
+
+static void do_ports(uint32_t id) {
+  uint32_t *ports = NULL;
+  size_t count = 0, cap = 0;
+  add_listening("/proc/net/tcp", &ports, &count, &cap);
+  add_listening("/proc/net/tcp6", &ports, &count, &cap);
+  buf_t out = {0};
+  uint8_t head[4];
+  put_u32(head, (uint32_t)count);
+  buf_add(&out, head, 4);
+  for (size_t i = 0; i < count; i++) {
+    uint8_t p[4];
+    put_u32(p, ports[i]);
+    buf_add(&out, p, 4);
+  }
+  free(ports);
+  send_frame(T_PORTS | T_REPLY, id, out.data, (uint32_t)out.len);
+  free(out.data);
+}
+
+/* Appends to a buffer that may grow past OUTPUT_CAP, up to cap. Returns -1 when that would exceed cap. */
+static int buf_append(buf_t *b, const uint8_t *src, size_t n, size_t cap) {
+  if (b->len + n > cap) return -1;
+  uint8_t *grown = realloc(b->data, b->len + n);
+  if (!grown) return -1;
+  memcpy(grown + b->len, src, n);
+  b->data = grown;
+  b->len += n;
+  return 0;
+}
+
+#define HTTP_CAP (MAX_FRAME - 5u - 1024u)
+
+/* HTTP: u32le port | u32le timeoutMs | the raw request. Sends it to 127.0.0.1:port, reads the raw response until the
+ * server closes the connection, and returns it. */
+static void do_http(uint32_t id, const uint8_t *payload, uint32_t len) {
+  if (len < 8) { send_error(id, "http: the request is a port, a timeout and the request bytes"); return; }
+  uint32_t port = get_u32(payload);
+  uint32_t timeout_ms = get_u32(payload + 4);
+  if (port == 0 || port > 65535) { send_error(id, "http: the port must be 1 to 65535"); return; }
+  if (timeout_ms == 0) timeout_ms = 30000;
+  const uint8_t *req = payload + 8;
+  size_t rlen = len - 8;
+  int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (s < 0) {
+    char msg[256];
+    snprintf(msg, sizeof msg, "http: socket: %s", strerror(errno));
+    send_error(id, msg);
+    return;
+  }
+  struct timeval tv;
+  tv.tv_sec = (time_t)(timeout_ms / 1000);
+  tv.tv_usec = (suseconds_t)((timeout_ms % 1000) * 1000);
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+  struct sockaddr_in sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sin_family = AF_INET;
+  sa.sin_port = htons((uint16_t)port);
+  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(s, (struct sockaddr *)&sa, sizeof sa) < 0) {
+    char msg[256];
+    snprintf(msg, sizeof msg, "http: connect 127.0.0.1:%u: %s", port, strerror(errno));
+    close(s);
+    send_error(id, msg);
+    return;
+  }
+  if (write_full(s, req, rlen) < 0) {
+    char msg[256];
+    snprintf(msg, sizeof msg, "http: send: %s", strerror(errno));
+    close(s);
+    send_error(id, msg);
+    return;
+  }
+  buf_t resp = {0};
+  uint8_t chunk[16384];
+  for (;;) {
+    ssize_t n = read(s, chunk, sizeof chunk);
+    if (n == 0) break;
+    if (n > 0) {
+      if (buf_append(&resp, chunk, (size_t)n, HTTP_CAP) < 0) {
+        free(resp.data);
+        close(s);
+        send_error(id, "http: the response is larger than one frame");
+        return;
+      }
+      continue;
+    }
+    if (errno == EINTR) continue;
+    free(resp.data);
+    close(s);
+    if (errno == EAGAIN || errno == EWOULDBLOCK) { send_error(id, "http: no response within the timeout"); return; }
+    char msg[256];
+    snprintf(msg, sizeof msg, "http: read: %s", strerror(errno));
+    send_error(id, msg);
+    return;
+  }
+  close(s);
+  send_frame(T_HTTP | T_REPLY, id, resp.data, (uint32_t)resp.len);
+  free(resp.data);
+}
+
 static void power_off(void) {
   sync();
   if (is_init) { reboot(RB_POWER_OFF); for (;;) pause(); }
@@ -599,6 +739,8 @@ static void serve(void) {
       case T_PS: do_ps(id); break;
       case T_STDIN: do_stdin(id, payload, plen); break;
       case T_END_STDIN: do_end_stdin(id, payload, plen); break;
+      case T_PORTS: do_ports(id); break;
+      case T_HTTP: do_http(id, payload, plen); break;
       case T_POWEROFF: send_frame(T_POWEROFF | T_REPLY, id, NULL, 0); free(body); power_off(); return;
       default: {
         char msg[64];

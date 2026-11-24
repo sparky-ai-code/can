@@ -84,6 +84,27 @@ describe('a VM guest', { skip: SKIP }, () => {
     assert.equal((await waitExit(sleeper)).exitCode, 128 + 15);
   });
 
+  test('ports and HTTP: a server in the guest is listed and answers a request from the host', { timeout: 60000 }, async () => {
+    const guest = guests[0];
+    await guest.exec(['/bin/busybox', 'mkdir', '-p', '/www']);
+    await guest.writeFile('/www/index.html', 'hello from the guest\n');
+    const id = await guest.spawn(['/bin/busybox', 'httpd', '-f', '-p', '8080', '-h', '/www']);
+    try {
+      let listed = [];
+      for (let i = 0; i < 100 && !listed.includes(8080); i++) {
+        listed = await guest.ports();
+        if (!listed.includes(8080)) await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.ok(listed.includes(8080), `port 8080 is listed: ${listed.join(',')}`);
+      const res = await guest.request({ port: 8080, path: '/' });
+      assert.equal(res.status, 200);
+      assert.match(res.body.toString(), /hello from the guest/);
+      await assert.rejects(() => guest.request({ port: 9, path: '/' }), (err) => err.code === 'ECONNREFUSED');
+    } finally {
+      await guest.killProgram(id, 9);
+    }
+  });
+
   test('poweroff syncs, powers the guest off, and exits with status 0', { timeout: 60000 }, async () => {
     const guest = guests[0];
     const code = await guest.poweroff();

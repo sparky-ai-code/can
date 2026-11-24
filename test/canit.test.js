@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   FrameDecoder, T, decodeExecResult, decodeHello, decodePs, decodeStatus, encodeExec, encodeFrame, encodeKill,
-  encodeLogs, encodeProgram, encodeRead, encodeSpawn, encodeWrite, OUTPUT_CAP,
+  encodeHttp, encodeLogs, encodeProgram, decodePorts, encodeRead, encodeSpawn, encodeWrite, OUTPUT_CAP,
 } from '../src/vm/guest-protocol.js';
 
 const SOURCE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'distro', 'canit', 'canit.c');
@@ -290,4 +290,32 @@ test('a program that cannot be run exits 127 and says why on stderr', { skip }, 
   assert.equal(s.exitCode, 127);
   assert.match(await logsOf(a, id, 2), /cannot run/);
   await a.close();
+});
+
+// Ports and HTTP: the agent lists the TCP ports it is listening on, and sends one HTTP request to a loopback port.
+test('ports lists a listening port; http reaches it; a refused connection is an error', { skip }, async () => {
+  const a = new Agent();
+  const port = 18081;
+  const id = await spawnBg(a, ['python3', '-m', 'http.server', String(port), '--bind', '127.0.0.1'], '/tmp');
+  try {
+    let listed = [];
+    for (let i = 0; i < 100 && !listed.includes(port); i++) {
+      const r = await a.request(T.PORTS, Buffer.alloc(0));
+      assert.equal(r.type, T.PORTS | T.REPLY, `ports reply was ${r.type}: ${r.payload}`);
+      listed = decodePorts(r.payload);
+      if (!listed.includes(port)) await sleepMs(100);
+    }
+    assert.ok(listed.includes(port), `the server's port is listed: ${listed.join(',')}`);
+    const request = Buffer.from(`GET / HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`, 'latin1');
+    const ok = await a.request(T.HTTP, encodeHttp({ port, request, timeoutMs: 10000 }));
+    assert.equal(ok.type, T.HTTP | T.REPLY, `http reply was ${ok.type}: ${ok.payload}`);
+    assert.match(ok.payload.toString('latin1'), /^HTTP\/1\.[01] 200 /);
+    const refused = await a.request(T.HTTP, encodeHttp({ port: 18099, request, timeoutMs: 5000 }));
+    assert.equal(refused.type, T.ERROR);
+    assert.match(refused.payload.toString(), /Connection refused/);
+  } finally {
+    await a.request(T.KILL, encodeKill(id, 9));
+    await untilExited(a, id);
+    await a.close();
+  }
 });

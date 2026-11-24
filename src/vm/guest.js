@@ -9,8 +9,8 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import {
-  FrameDecoder, T, decodeExecResult, decodeHello, decodePs, decodeStatus, encodeExec, encodeFrame, encodeKill,
-  encodeLogs, encodeProgram, encodeRead, encodeSpawn, encodeWrite,
+  FrameDecoder, T, decodeExecResult, decodeHello, decodePorts, decodePs, decodeStatus, encodeExec, encodeFrame,
+  encodeHttp, encodeKill, encodeLogs, encodeProgram, encodeRead, encodeSpawn, encodeWrite,
 } from './guest-protocol.js';
 import {
   accelCandidates, buildQemuArgs, channelEndpoint, guestArchFor, vmInstalled, vmPaths,
@@ -35,7 +35,46 @@ function errorFromReply(text) {
   if (/No such file or directory/.test(text)) return guestError('ENOENT', text);
   if (/Permission denied/.test(text)) return guestError('EACCES', text);
   if (/is a folder/.test(text)) return guestError('EISDIR', text);
+  if (/Connection refused/.test(text)) return guestError('ECONNREFUSED', text);
+  if (/no response within/.test(text)) return guestError('ETIMEDOUT', text);
   return guestError('EIO', text);
+}
+
+/** The body of an HTTP/1.1 response that uses chunked transfer coding, with the chunks joined. */
+function dechunk(body) {
+  const parts = [];
+  let at = 0;
+  for (;;) {
+    const eol = body.indexOf('\r\n', at, 'latin1');
+    if (eol < 0) break;
+    const size = Number.parseInt(body.toString('latin1', at, eol), 16);
+    if (!Number.isFinite(size) || size < 0) break;
+    at = eol + 2;
+    if (size === 0) break;
+    parts.push(body.subarray(at, at + size));
+    at += size + 2;
+  }
+  return Buffer.concat(parts);
+}
+
+/** Splits a raw HTTP/1.1 response into its status, headers (lower-case names) and body. */
+export function parseHttpResponse(raw) {
+  const split = raw.indexOf('\r\n\r\n');
+  if (split < 0) throw guestError('EPROTO', 'the response has no end of headers');
+  const lines = raw.toString('latin1', 0, split).split('\r\n');
+  const m = /^HTTP\/1\.[01] (\d{3})/.exec(lines[0]);
+  if (!m) throw guestError('EPROTO', `not an HTTP response: ${JSON.stringify(lines[0])}`);
+  const headers = {};
+  for (const line of lines.slice(1)) {
+    const colon = line.indexOf(':');
+    if (colon < 0) continue;
+    const name = line.slice(0, colon).trim().toLowerCase();
+    const value = line.slice(colon + 1).trim();
+    headers[name] = headers[name] === undefined ? value : `${headers[name]}, ${value}`;
+  }
+  let body = raw.subarray(split + 4);
+  if ((headers['transfer-encoding'] ?? '').toLowerCase().includes('chunked')) body = dechunk(body);
+  return { status: Number(m[1]), headers, body };
 }
 
 export class Guest {
@@ -212,6 +251,34 @@ export class Guest {
   endStdin(id) {
     return this.#queued(async () => {
       await this.#ask(T.END_STDIN, encodeProgram(id), DEFAULT_REQUEST_MS);
+    });
+  }
+
+  /** The TCP ports the guest is listening on, as numbers. */
+  ports() {
+    return this.#queued(async () => decodePorts((await this.#ask(T.PORTS, Buffer.alloc(0), DEFAULT_REQUEST_MS)).payload));
+  }
+
+  /**
+   * One HTTP request to a server inside the guest, on 127.0.0.1:port. Returns {status, headers, body} as the response
+   * arrived; headers have lower-case names. The request asks the server to close the connection, so the whole
+   * response is read. A refused connection rejects with ECONNREFUSED.
+   */
+  request({
+    port, method = 'GET', path = '/', headers = {}, body, timeoutMs = 30000,
+  }) {
+    const payload = body === undefined ? Buffer.alloc(0) : Buffer.from(body);
+    const lines = [`${method} ${path} HTTP/1.1`, `Host: 127.0.0.1:${port}`, 'Connection: close'];
+    for (const [name, value] of Object.entries(headers)) {
+      if (/^(host|connection|content-length)$/i.test(name)) continue;
+      lines.push(`${name}: ${value}`);
+    }
+    if (body !== undefined) lines.push(`Content-Length: ${payload.length}`);
+    const head = Buffer.from(`${lines.join('\r\n')}\r\n\r\n`, 'latin1');
+    const request = Buffer.concat([head, payload]);
+    return this.#queued(async () => {
+      const reply = await this.#ask(T.HTTP, encodeHttp({ port, timeoutMs, request }), timeoutMs + 5000);
+      return parseHttpResponse(reply.payload);
     });
   }
 
