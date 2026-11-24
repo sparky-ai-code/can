@@ -36,13 +36,15 @@ export class VmCan {
   #guest;
 
   constructor({
-    id, name, guest, createdAt, overlay, browser = false,
+    id, name, guest, createdAt, overlay, browser = false, memMB = 256,
   }) {
     this.id = id;
     this.name = name;
     this.createdAt = createdAt;
     this.overlay = overlay;
     this.browser = browser;
+    this.memMB = memMB;
+    this.cwd = HOME; // the default folder for exec and spawn; setCwd changes it
     this.#guest = guest;
   }
 
@@ -94,7 +96,7 @@ export class VmCan {
   /** Runs a shell line in the guest. Resolves to {exitCode, signal, stdout, stderr, timedOut}, as Can.exec does. */
   async exec(command, opts = {}) {
     const r = await this.#guest.exec(['/bin/sh', '-c', String(command)], {
-      cwd: opts.cwd ?? HOME,
+      cwd: opts.cwd ?? this.cwd,
       timeoutMs: opts.timeoutMs ?? 0,
     });
     return { exitCode: r.exitCode, signal: null, stdout: r.stdout, stderr: r.stderr, timedOut: r.timedOut };
@@ -102,7 +104,7 @@ export class VmCan {
 
   /** Starts a shell line in the background. Resolves to the process view at once, with its pid. */
   async spawn(command, opts = {}) {
-    const pid = await this.#guest.spawn(['/bin/sh', '-c', String(command)], { cwd: opts.cwd ?? HOME });
+    const pid = await this.#guest.spawn(['/bin/sh', '-c', String(command)], { cwd: opts.cwd ?? this.cwd });
     return this.#view(pid, String(command));
   }
 
@@ -226,21 +228,68 @@ export class VmCan {
     return this.#guest.request({ port, method, path: target, headers, body, timeoutMs: timeout });
   }
 
+  /** Makes a folder the default for exec and spawn. The folder must exist. */
+  async setCwd(folder) {
+    const abs = this.#abs(folder);
+    if (!(await this.exists(abs))) throw guestError('ENOENT', `no folder ${abs}`);
+    if ((await this.#applet(['test', '-d', abs])).exitCode !== 0) throw guestError('ENOTDIR', `${abs} is not a folder`);
+    this.cwd = abs;
+  }
+
+  /**
+   * The file's type ('file', 'dir' or 'symlink'), size, mode and modification time. The result also has isFile(),
+   * isDirectory() and isSymbolicLink(), as Can's stat does.
+   */
+  async stat(target) {
+    const r = await this.#applet(['stat', '-c', '%F|%s|%a|%Y', this.#abs(target)]);
+    if (r.exitCode !== 0) throw guestError('ENOENT', r.stderr.trim() || `cannot stat ${target}`);
+    const [kind, size, mode, mtime] = r.stdout.trim().split('|');
+    const type = kind.includes('directory') ? 'dir' : kind.includes('symbolic') ? 'symlink' : 'file';
+    return {
+      type,
+      size: Number(size),
+      mode: Number.parseInt(mode, 8),
+      mtime: new Date(Number(mtime) * 1000),
+      isFile: () => type === 'file',
+      isDirectory: () => type === 'dir',
+      isSymbolicLink: () => type === 'symlink',
+    };
+  }
+
+  /**
+   * Memory the guest uses now, and the limit it was started with. The guest has no soft limit of its own, so softBytes
+   * is the same as limitBytes.
+   */
+  async memoryInfo() {
+    const r = await this.exec('cat /proc/meminfo', { cwd: '/' });
+    const kb = (field) => {
+      const m = new RegExp(`^${field}:\\s+(\\d+) kB`, 'm').exec(r.stdout);
+      return m ? Number(m[1]) : 0;
+    };
+    const used = (kb('MemTotal') - kb('MemAvailable')) * 1024;
+    const limit = this.memMB * 1024 * 1024;
+    return {
+      usedBytes: used, peakBytes: used, softBytes: limit, limitBytes: limit, enforced: 'guest',
+    };
+  }
+
+  /**
+   * A snapshot of the can's disk: its files are flushed to the disk, and the disk's path is returned. A memory snapshot
+   * cannot be taken on this host (see spike/README.md), so a snapshot is the disk, the same thing save and restore keep.
+   */
+  async snapshot() {
+    const flushed = await this.#applet(['sync']);
+    if (flushed.exitCode !== 0) throw guestError('EIO', flushed.stderr.trim() || 'sync failed');
+    return { disk: this.overlay, savedAt: new Date().toISOString() };
+  }
+
   // ---- not on the VM yet
-
-  setCwd() { throw notSupported('setCwd'); }
-
-  stat() { throw notSupported('stat'); }
 
   openBrowser() { throw notSupported('the browser'); }
 
   browse() { throw notSupported('the browser'); }
 
   screenshot() { throw notSupported('screenshots'); }
-
-  snapshot() { throw notSupported('a VM snapshot (use save, which keeps the disk)'); }
-
-  memoryInfo() { throw notSupported('memory accounting'); }
 
   /** Shuts the guest down cleanly, so its disk is consistent. The can is then stopped. */
   async save() {
@@ -341,7 +390,7 @@ export class VmCanManager {
       internet,
     });
     return new VmCan({
-      id, name, guest, createdAt, overlay, browser,
+      id, name, guest, createdAt, overlay, browser, memMB: browser ? Math.max(this.#memMB, 1792) : this.#memMB,
     });
   }
 

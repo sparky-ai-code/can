@@ -276,7 +276,7 @@ export function createTools(registry, { transferRoot = defaultTransferRoot(), br
 
     let memory = 'unavailable';
     try {
-      const m = live && typeof live.memoryInfo === 'function' ? live.memoryInfo() : null;
+      const m = live && typeof live.memoryInfo === 'function' ? await live.memoryInfo() : null;
       if (m) {
         memory = `${(m.usedBytes / MB).toFixed(1)} MB used, peak ${(m.peakBytes / MB).toFixed(1)} MB, `
           + `limit ${MB_LIMIT} MB (soft ${MB_SOFT} MB), enforced by ${m.enforced}`;
